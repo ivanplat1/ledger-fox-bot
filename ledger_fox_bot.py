@@ -19,7 +19,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import requests
 
@@ -33,7 +33,7 @@ except ModuleNotFoundError:  # pragma: no cover - import guard
 try:
     import pytesseract
     from pytesseract import Output
-    from PIL import Image, ImageOps, ImageFilter
+    from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageFont
     TESSERACT_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover - import guard
     pytesseract = None  # type: ignore
@@ -102,6 +102,7 @@ logging.info("Active preprocess pipeline hash marker: portrait-fix-v3")
 
 class ReceiptStates(StatesGroup):
     waiting_for_photo = State()
+    waiting_for_confirmation = State()
 
 
 class StatementStates(StatesGroup):
@@ -152,6 +153,8 @@ class ProcessingResult:
     success: bool
     summary: Optional[str] = None
     error: Optional[str] = None
+    parsed_receipt: Optional[ParsedReceipt] = None
+    receipt_payload: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -177,10 +180,18 @@ RECEIPT_EXTRACTION_PROMPT = os.getenv(
         "\"total\": float, \"tax_amount\": float | null, "
         "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
         " Если в чеке нет позиции, всё равно верни items c хотя бы одной строкой и ставь приблизительные значения."
-        "\n\nВАЖНО: Для каждого товара определи категорию на основе его названия. "
-        "Используй категории: \"Продукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", "
-        "\"Бытовая химия\", \"Электроника\", \"Ресторан/Кафе\", \"Транспорт\", \"Здоровье\", "
-        "\"Развлечения\", \"Другое\". Если категория не очевидна, используй \"Другое\"."
+        "\n\nВАЖНО: "
+        "- \"quantity\" - это количество товара (например, 2, 3, 1.5)"
+        "- \"price\" - это ОБЩАЯ сумма за позицию (количество × цена за единицу), а не цена за единицу"
+        "- Для каждого товара определи категорию на основе его названия. "
+        "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
+        "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
+        "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
+        "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
+        "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
+        "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
+        "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
+        "Если категория не очевидна, используй \"Другое\"."
     ),
 ).strip()
 RECEIPT_MODEL = os.getenv("RECEIPT_OCR_MODEL", "gpt-4o").strip()
@@ -324,9 +335,13 @@ class ReceiptParserAI:
             '"total": float, "tax_amount": float | null, '
             '"items": [{"name": str, "quantity": float, "price": float, "category": str | null}]}. '
             "Улучши категории товаров на основе их названий. "
-            "Используй категории: \"Продукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", "
-            "\"Бытовая химия\", \"Электроника\", \"Ресторан/Кафе\", \"Транспорт\", \"Здоровье\", "
-            "\"Развлечения\", \"Другое\". "
+            "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
+            "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
+            "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
+            "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
+            "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
+            "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
+            "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
             "Исправь названия товаров, если они некорректны. "
             "Сохрани все исходные данные, только улучши их."
         )
@@ -669,8 +684,7 @@ class LedgerFoxBot:
             if message.media_group_id:
                 await self._collect_media_group(message)
                 return
-            await self._process_receipt_message(message)
-            await state.clear()
+            await self._process_receipt_message(message, state)
 
         @self.router.message(Command("statement"))
         async def handle_statement_entry(message: Message, state: FSMContext) -> None:
@@ -715,7 +729,7 @@ class LedgerFoxBot:
             classification = classify_upload_kind(message)
             if classification == "receipt":
                 await state.clear()
-                await self._process_receipt_message(message)
+                await self._process_receipt_message(message, state)
                 return
             if classification == "statement":
                 await state.clear()
@@ -791,14 +805,89 @@ class LedgerFoxBot:
             await self.supabase.record_expense(payload)
             await message.answer("Расход добавлен вручную.")
 
-    async def _process_receipt_message(self, message: Message) -> None:
+        @self.router.callback_query(F.data == "receipt_confirm")
+        async def handle_receipt_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик подтверждения чека"""
+            await callback.answer()
+            data = await state.get_data()
+            parsed_receipt = data.get("parsed_receipt")
+            receipt_payload = data.get("receipt_payload")
+            
+            if not receipt_payload or not callback.from_user:
+                await callback.message.answer("Ошибка: данные чека не найдены.")
+                await state.clear()
+                return
+            
+            try:
+                # Сохраняем чек в базу
+                stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
+                if is_duplicate:
+                    await callback.message.answer("⚠️ Этот чек уже был сохранен ранее (дубликат)")
+                else:
+                    # Создаем expense запись из receipt только если это новый чек
+                    expense_payload = build_expense_payload_from_receipt(stored_receipt)
+                    await self.supabase.record_expense(expense_payload)
+                    await callback.message.answer("✅ Чек сохранен в базу данных")
+                await state.clear()
+            except Exception as exc:
+                logging.exception(f"Ошибка при сохранении чека: {exc}")
+                await callback.message.answer(f"⚠️ Не удалось сохранить в базу: {str(exc)[:100]}")
+                await state.clear()
+
+        @self.router.callback_query(F.data == "receipt_reject")
+        async def handle_receipt_reject(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик отклонения чека"""
+            await callback.answer()
+            await callback.message.answer("Понял, отправьте фото чека заново для переснятия.")
+            await state.clear()
+
+    async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
         await message.answer("Чек принят, распознаю…")
         result = await self._handle_receipt_from_message(message)
         logging.info(f"Receipt processing result: success={result.success}, has_summary={bool(result.summary)}, has_error={bool(result.error)}")
         if result.success and result.summary:
+            # Сохраняем данные чека в FSM для подтверждения
+            if result.parsed_receipt and result.receipt_payload:
+                await state.update_data(
+                    parsed_receipt=result.parsed_receipt,
+                    receipt_payload=result.receipt_payload,
+                )
+                await state.set_state(ReceiptStates.waiting_for_confirmation)
+            
+            # Создаем кнопки для подтверждения (в разных рядах)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Все верно", callback_data="receipt_confirm"),
+                ],
+                [
+                    InlineKeyboardButton(text="❌ Есть ошибка (переснять)", callback_data="receipt_reject"),
+                ]
+            ])
+            
+            # Пытаемся сгенерировать изображение
+            if result.parsed_receipt:
+                img_bytes = generate_receipt_image(result.parsed_receipt)
+                if img_bytes:
+                    # Отправляем изображение
+                    photo = BufferedInputFile(img_bytes, filename="receipt.png")
+                    await message.answer_photo(photo, reply_markup=keyboard)
+                    
+                    # Добавляем дополнительную информацию текстом, если есть
+                    additional_info = ""
+                    if "QR-кода" in result.summary or "QR" in result.summary:
+                        # Извлекаем информацию о QR-коде из summary
+                        qr_part = result.summary.split("📱")[-1] if "📱" in result.summary else ""
+                        if qr_part:
+                            additional_info = f"\n\n📱{qr_part}"
+                    
+                    if additional_info:
+                        await message.answer(additional_info.strip())
+                    return
+            
+            # Fallback: отправляем текстом если не удалось сгенерировать изображение
             truncated_summary = truncate_message_for_telegram(result.summary)
-            logging.info(f"Sending receipt summary to user: {len(result.summary)} chars (truncated to {len(truncated_summary)})")
-            await message.answer(truncated_summary)
+            logging.info(f"Sending receipt summary to user (text fallback): {len(result.summary)} chars")
+            await message.answer(truncated_summary, reply_markup=keyboard)
             return
         error_msg = result.error or "Не удалось обработать чек."
         logging.warning(f"Sending error to user: {error_msg}")
@@ -854,101 +943,56 @@ class LedgerFoxBot:
                                 if content:
                                     try:
                                         final_data = json.loads(content)
-                                        content_clean = json.dumps(final_data, ensure_ascii=False, indent=2)
                                     except json.JSONDecodeError:
                                         # Если не удалось распарсить, используем исходные данные
                                         final_data = receipt_data
-                                        content_clean = json.dumps(receipt_data, ensure_ascii=False, indent=2)
-                                else:
-                                    final_data = receipt_data
-                                    content_clean = json.dumps(receipt_data, ensure_ascii=False, indent=2)
-                            else:
-                                final_data = receipt_data
-                                content_clean = json.dumps(receipt_data, ensure_ascii=False, indent=2)
                             
-                            # Извлекаем информацию о токенах
-                            usage = response_json.get("usage", {})
-                            prompt_tokens = usage.get("prompt_tokens", 0)
-                            completion_tokens = usage.get("completion_tokens", 0)
-                            total_tokens = usage.get("total_tokens", 0)
+                            # Парсим в ParsedReceipt и форматируем таблицу
+                            parsed_receipt = build_parsed_receipt(final_data)
+                            receipt_table = format_receipt_table(parsed_receipt)
                             
-                            prompt_tokens_details = usage.get("prompt_tokens_details", {})
-                            cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
-                            
-                            if cached_tokens > 0:
-                                tokens_info = f"\n\nТокены: prompt={prompt_tokens} (кэшировано: {cached_tokens}), completion={completion_tokens}, total={total_tokens}"
-                            else:
-                                tokens_info = f"\n\nТокены: prompt={prompt_tokens} (не кэшировано), completion={completion_tokens}, total={total_tokens}"
-                            
-                            # Сохраняем в базу данных
+                            # Подготавливаем данные для сохранения (но не сохраняем сразу)
+                            receipt_payload = None
                             if self.supabase and message.from_user:
                                 try:
-                                    # Парсим JSON данные в ParsedReceipt
-                                    parsed_receipt = build_parsed_receipt(final_data)
-                                    
-                                    # Создаем payload для базы
                                     receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                                    
-                                    # Сохраняем чек в базу
-                                    stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
-                                    if is_duplicate:
-                                        logging.info(f"⚠️ Чек уже существует в базе: receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        tokens_info += "\n\n⚠️ Этот чек уже был сохранен ранее (дубликат)"
-                                    else:
-                                        logging.info(f"✅ Чек сохранен в базу: receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        # Создаем expense запись из receipt только если это новый чек
-                                        expense_payload = build_expense_payload_from_receipt(stored_receipt)
-                                        await self.supabase.record_expense(expense_payload)
-                                        logging.info(f"✅ Расход создан из чека: expense_hash={expense_payload.get('expense_hash')}")
-                                        tokens_info += "\n\n✅ Чек сохранен в базу данных"
+                                    logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
                                 except Exception as db_exc:
-                                    logging.exception(f"Ошибка при сохранении чека в базу: {db_exc}")
-                                    tokens_info += f"\n\n⚠️ Не удалось сохранить в базу: {db_exc}"
+                                    logging.exception(f"Ошибка при создании payload: {db_exc}")
                             
                             # Добавляем информацию о QR-коде
                             qr_info = f"\n\n📱 Данные получены из QR-кода и улучшены через OpenAI: {qr_data}"
                             
-                            summary = content_clean + qr_info + tokens_info
+                            summary = receipt_table + qr_info
                             
                             return ProcessingResult(
                                 success=True,
                                 summary=summary,
+                                parsed_receipt=parsed_receipt,
+                                receipt_payload=receipt_payload,
                             )
                         except Exception as exc:
                             logging.exception(f"Ошибка при улучшении данных через OpenAI: {exc}")
-                            # Если не удалось улучшить, возвращаем исходные данные
-                            content_clean = json.dumps(receipt_data, ensure_ascii=False, indent=2)
+                            # Если не удалось улучшить, используем исходные данные
+                            parsed_receipt = build_parsed_receipt(receipt_data)
+                            receipt_table = format_receipt_table(parsed_receipt)
                             
-                            # Сохраняем в базу данных даже без улучшения
+                            # Подготавливаем данные для сохранения (но не сохраняем сразу)
+                            receipt_payload = None
                             if self.supabase and message.from_user:
                                 try:
-                                    # Парсим JSON данные в ParsedReceipt
-                                    parsed_receipt = build_parsed_receipt(receipt_data)
-                                    
-                                    # Создаем payload для базы
                                     receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                                    
-                                    # Сохраняем чек в базу
-                                    stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
-                                    if is_duplicate:
-                                        logging.info(f"⚠️ Чек уже существует в базе: receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        content_clean += "\n\n⚠️ Этот чек уже был сохранен ранее (дубликат)"
-                                    else:
-                                        logging.info(f"✅ Чек сохранен в базу: receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        # Создаем expense запись из receipt только если это новый чек
-                                        expense_payload = build_expense_payload_from_receipt(stored_receipt)
-                                        await self.supabase.record_expense(expense_payload)
-                                        logging.info(f"✅ Расход создан из чека: expense_hash={expense_payload.get('expense_hash')}")
-                                        content_clean += "\n\n✅ Чек сохранен в базу данных"
+                                    logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
                                 except Exception as db_exc:
-                                    logging.exception(f"Ошибка при сохранении чека в базу: {db_exc}")
-                                    content_clean += f"\n\n⚠️ Не удалось сохранить в базу: {db_exc}"
+                                    logging.exception(f"Ошибка при создании payload: {db_exc}")
                             
                             qr_info = f"\n\n📱 Данные получены из QR-кода (без улучшения через OpenAI): {qr_data}"
-                            summary = content_clean + qr_info
+                            summary = receipt_table + qr_info
                             return ProcessingResult(
                                 success=True,
                                 summary=summary,
+                                parsed_receipt=parsed_receipt,
+                                receipt_payload=receipt_payload,
                             )
                     else:
                         logging.warning(f"⚠️ Не удалось получить данные из QR-кода: {qr_data}, используем OpenAI")
@@ -992,22 +1036,25 @@ class LedgerFoxBot:
                 if not content:
                     raise ReceiptParsingError("OpenAI response не содержит content")
                 
-                # Убираем экранированные символы (\n, \t и т.д.)
-                # content уже является строкой JSON, нужно её распарсить и переформатировать
+                # Парсим JSON из content
                 content_json = None
                 try:
-                    # Парсим JSON из content, чтобы убрать экранирование
+                    # Парсим JSON из content
                     content_json = json.loads(content)
-                    # Форматируем обратно без экранирования
-                    content_clean = json.dumps(content_json, ensure_ascii=False, indent=2)
                 except json.JSONDecodeError:
-                    # Если не JSON, просто убираем escape-последовательности
-                    content_clean = content.encode().decode('unicode_escape')
-                    # Пытаемся распарсить еще раз после декодирования
+                    # Если не JSON, пытаемся декодировать escape-последовательности
                     try:
-                        content_json = json.loads(content_clean)
-                    except json.JSONDecodeError:
+                        content_decoded = content.encode().decode('unicode_escape')
+                        content_json = json.loads(content_decoded)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         logging.warning("Не удалось распарсить JSON из content")
+                        raise ReceiptParsingError("Не удалось распарсить ответ от OpenAI")
+                
+                # Преобразуем в ParsedReceipt для форматирования
+                parsed_receipt = build_parsed_receipt(content_json)
+                
+                # Форматируем чек в виде таблицы
+                receipt_table = format_receipt_table(parsed_receipt)
                 
                 # Извлекаем информацию о токенах
                 usage = response_json.get("usage", {})
@@ -1019,21 +1066,16 @@ class LedgerFoxBot:
                 prompt_tokens_details = usage.get("prompt_tokens_details", {})
                 cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
                 
-                # Формируем итоговый ответ с токенами
-                if cached_tokens > 0:
-                    tokens_info = f"\n\nТокены: prompt={prompt_tokens} (кэшировано: {cached_tokens}), completion={completion_tokens}, total={total_tokens}"
-                else:
-                    tokens_info = f"\n\nТокены: prompt={prompt_tokens} (не кэшировано), completion={completion_tokens}, total={total_tokens}"
+                # Формируем итоговый ответ
+                summary = receipt_table
                 
                 # Добавляем информацию о QR-кодах, если они были найдены
-                qr_info = ""
                 if qr_codes:
                     qr_info = "\n\n📱 Найденные QR-коды:\n"
                     for i, qr in enumerate(qr_codes, 1):
                         qr_info += f"{i}. Тип: {qr['type']}\n"
                         qr_info += f"   Данные: {qr['data']}\n"
-                
-                summary = content_clean + qr_info + tokens_info
+                    summary += qr_info
                 
                 # Логируем информацию о кэшировании
                 if cached_tokens > 0:
@@ -1041,60 +1083,28 @@ class LedgerFoxBot:
                 else:
                     logging.warning(f"⚠️ Кэширование не работает. Prompt tokens: {prompt_tokens}. Возможно, промпт слишком короткий (< 1024 токенов)")
                 
-                logging.info(f"Extracted content: {len(content_clean)} chars, tokens: {total_tokens}")
+                logging.info(f"Parsed receipt: store={parsed_receipt.store}, total={parsed_receipt.total}, items={len(parsed_receipt.items)}, tokens: {total_tokens}")
                 
-                # Сохраняем в базу данных
+                # Подготавливаем данные для сохранения (но не сохраняем сразу)
+                receipt_payload = None
                 if self.supabase and message.from_user:
                     try:
-                        # Парсим JSON данные в ParsedReceipt
-                        if content_json is None:
-                            # Если content_json не определен, пытаемся распарсить заново
-                            try:
-                                content_json = json.loads(content_clean)
-                                logging.info("Успешно распарсили JSON для сохранения в базу")
-                            except (json.JSONDecodeError, TypeError) as parse_exc:
-                                logging.warning(f"Не удалось распарсить JSON для сохранения в базу: {parse_exc}")
-                                content_json = None
-                        
-                        if content_json:
-                            parsed_receipt = build_parsed_receipt(content_json)
-                            
-                            # Создаем payload для базы
-                            receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                            logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
-                            
-                            # Сохраняем чек в базу
-                            stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
-                            if is_duplicate:
-                                logging.info(f"⚠️ Чек уже существует в базе: receipt_hash={receipt_payload.get('receipt_hash')}")
-                                summary += "\n\n⚠️ Этот чек уже был сохранен ранее (дубликат)"
-                            else:
-                                logging.info(f"✅ Чек сохранен в базу: receipt_hash={receipt_payload.get('receipt_hash')}, id={stored_receipt.get('id')}")
-                                # Создаем expense запись из receipt только если это новый чек
-                                expense_payload = build_expense_payload_from_receipt(stored_receipt)
-                                await self.supabase.record_expense(expense_payload)
-                                logging.info(f"✅ Расход создан из чека: expense_hash={expense_payload.get('expense_hash')}")
-                                summary += "\n\n✅ Чек сохранен в базу данных"
-                        else:
-                            logging.warning("Не удалось распарсить JSON, пропускаем сохранение в базу")
-                            summary += "\n\n⚠️ Не удалось сохранить в базу: ошибка парсинга данных"
+                        # Создаем payload для базы
+                        receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
+                        logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
                     except Exception as db_exc:
-                        logging.exception(f"Ошибка при сохранении чека в базу: {db_exc}")
-                        summary += f"\n\n⚠️ Не удалось сохранить в базу: {str(db_exc)[:100]}"
-                else:
-                    if not self.supabase:
-                        logging.warning("Supabase не подключен, пропускаем сохранение")
-                    if not message.from_user:
-                        logging.warning("Не удалось получить user_id, пропускаем сохранение")
+                        logging.exception(f"Ошибка при создании payload: {db_exc}")
                 
                 return ProcessingResult(
                     success=True,
                     summary=summary,
+                    parsed_receipt=parsed_receipt,
+                    receipt_payload=receipt_payload,
                 )
             except Exception as exc:
                 logging.error(f"Error extracting content: {exc}", exc_info=True)
-                # Fallback: возвращаем весь response как JSON
-                response_str = json.dumps(response_json, ensure_ascii=False, indent=2)
+                # Fallback: пытаемся извлечь данные и показать таблицу или JSON
+                response_str = ""
                 
                 # Пытаемся сохранить в базу даже при ошибке парсинга
                 if self.supabase and message.from_user:
@@ -1108,20 +1118,35 @@ class LedgerFoxBot:
                                 try:
                                     fallback_data = json.loads(content)
                                     parsed_receipt = build_parsed_receipt(fallback_data)
-                                    receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                                    stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
-                                    if is_duplicate:
-                                        logging.info(f"⚠️ Чек уже существует в базе (fallback): receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        response_str += "\n\n⚠️ Этот чек уже был сохранен ранее (дубликат)"
-                                    else:
-                                        logging.info(f"✅ Чек сохранен в базу (fallback): receipt_hash={receipt_payload.get('receipt_hash')}")
-                                        expense_payload = build_expense_payload_from_receipt(stored_receipt)
-                                        await self.supabase.record_expense(expense_payload)
-                                        response_str += "\n\n✅ Чек сохранен в базу данных (fallback)"
+                                    # Форматируем в таблицу
+                                    response_str = format_receipt_table(parsed_receipt)
+                                    
+                                    # Подготавливаем данные для сохранения (но не сохраняем сразу)
+                                    receipt_payload = None
+                                    if self.supabase and message.from_user:
+                                        try:
+                                            receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
+                                            logging.info(f"Создан payload для сохранения (fallback): store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
+                                        except Exception as payload_exc:
+                                            logging.exception(f"Ошибка при создании payload (fallback): {payload_exc}")
+                                    
+                                    return ProcessingResult(
+                                        success=True,
+                                        summary=response_str,
+                                        parsed_receipt=parsed_receipt,
+                                        receipt_payload=receipt_payload,
+                                    )
                                 except Exception as fallback_exc:
-                                    logging.exception(f"Ошибка при сохранении в fallback: {fallback_exc}")
+                                    logging.exception(f"Ошибка при парсинге в fallback: {fallback_exc}")
+                                    # Если не удалось распарсить, показываем JSON
+                                    response_str = json.dumps(response_json, ensure_ascii=False, indent=2)
                     except Exception as db_exc:
                         logging.exception(f"Ошибка при сохранении в базу (fallback): {db_exc}")
+                        if not response_str:
+                            response_str = json.dumps(response_json, ensure_ascii=False, indent=2)
+                
+                if not response_str:
+                    response_str = f"Ошибка обработки: {exc}\n\nПолный ответ:\n{json.dumps(response_json, ensure_ascii=False, indent=2)}"
                 
                 return ProcessingResult(
                     success=True,
@@ -1312,6 +1337,271 @@ def format_receipt_summary(parsed: ParsedReceipt) -> str:
         if len(parsed.items) > 10:
             lines.append(f"   … и ещё {len(parsed.items) - 10} позиций")
     return "\n".join(lines)
+
+
+def format_receipt_table(parsed: ParsedReceipt) -> str:
+    """
+    Форматирует чек в виде таблицы: название, количество, общая цена позиции, итог.
+    """
+    lines = []
+    
+    # Заголовок с магазином и датой
+    if parsed.store:
+        lines.append(f"🏪 {parsed.store}")
+    if parsed.purchased_at:
+        lines.append(f"📅 {parsed.purchased_at.strftime('%Y-%m-%d %H:%M')}")
+    lines.append("")
+    
+    # Фиксированная компактная ширина колонок
+    name_width = 25  # Название товара (обрезаем до 25 символов)
+    qty_width = 6    # Количество
+    price_width = 12 # Сумма
+    
+    # Заголовок таблицы
+    lines.append(f"{'Товар':<{name_width}} {'Кол-во':>{qty_width}} {'Сумма':>{price_width}}")
+    lines.append("-" * (name_width + qty_width + price_width + 4))
+    
+    # Позиции
+    for item in parsed.items:
+        # Обрезаем название если слишком длинное
+        name = item.name[:25] if len(item.name) > 25 else item.name
+        quantity = item.quantity
+        total_price = item.price
+        
+        # Исправляем перепутанные данные: если quantity выглядит как цена за единицу
+        # Если quantity близко к total_price (в пределах 5%), то количество = 1
+        if quantity > 0 and total_price > 0:
+            if abs(quantity - total_price) / max(quantity, total_price) < 0.05:
+                # quantity и price почти равны, значит количество = 1
+                quantity = 1.0
+            else:
+                # Пробуем вычислить количество: price / quantity
+                calculated_qty = total_price / quantity
+                # Если получилось разумное количество (от 0.5 до 100) и близко к целому
+                if 0.5 <= calculated_qty <= 100:
+                    rounded_qty = round(calculated_qty)
+                    # Если округленное значение близко к вычисленному, используем его
+                    if abs(calculated_qty - rounded_qty) < 0.1:
+                        quantity = float(rounded_qty)
+                    else:
+                        quantity = calculated_qty
+                # Если quantity больше total_price, точно перепутано
+                elif quantity > total_price and calculated_qty >= 0.5:
+                    quantity = round(calculated_qty) if calculated_qty <= 100 else calculated_qty
+        
+        # Форматируем строку таблицы
+        # Используем целое число для quantity, если оно целое
+        if quantity == int(quantity):
+            qty_str = f"{int(quantity)}"
+        else:
+            qty_str = f"{quantity:g}"
+        price_str = f"{total_price:.2f}"
+        
+        # Выравниваем с фиксированными позициями
+        lines.append(f"{name:<{name_width}} {qty_str:>{qty_width}} {price_str:>{price_width}}")
+    
+    # Итоговая строка
+    lines.append("-" * (name_width + qty_width + price_width + 4))
+    total_str = f"{parsed.total:.2f} {parsed.currency}"
+    lines.append(f"{'ИТОГО':<{name_width}} {'':>{qty_width}} {total_str:>{price_width}}")
+    
+    # Оборачиваем в код-блок для моноширинного шрифта
+    table_text = "\n".join(lines)
+    return f"```\n{table_text}\n```"
+
+
+def generate_receipt_image(parsed: ParsedReceipt) -> Optional[bytes]:
+    """
+    Генерирует изображение с таблицей чека.
+    Возвращает bytes изображения в формате PNG или None если PIL недоступен.
+    """
+    if Image is None or ImageDraw is None:
+        return None
+    
+    try:
+        # Параметры изображения
+        padding = 40
+        line_height = 35
+        font_size = 24
+        header_font_size = 28
+        title_font_size = 32
+        
+        # Пытаемся загрузить шрифт, если не получается - используем стандартный
+        try:
+            title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", title_font_size)
+            header_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", header_font_size)
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+        except:
+            try:
+                title_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", title_font_size)
+                header_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", header_font_size)
+                font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", font_size)
+            except:
+                # Используем стандартный шрифт
+                title_font = ImageFont.load_default()
+                header_font = ImageFont.load_default()
+                font = ImageFont.load_default()
+        
+        # Подготавливаем данные для таблицы (без эмодзи для изображения)
+        store_text = parsed.store if parsed.store else ""
+        date_text = parsed.purchased_at.strftime('%Y-%m-%d %H:%M') if parsed.purchased_at else ""
+        
+        # Обрабатываем товары
+        items_data = []
+        for item in parsed.items:
+            name = item.name[:30] if len(item.name) > 30 else item.name
+            quantity = item.quantity
+            total_price = item.price
+            
+            # Исправляем перепутанные данные (та же логика что и в format_receipt_table)
+            if quantity > 0 and total_price > 0:
+                if abs(quantity - total_price) / max(quantity, total_price) < 0.05:
+                    quantity = 1.0
+                else:
+                    calculated_qty = total_price / quantity
+                    if 0.5 <= calculated_qty <= 100:
+                        rounded_qty = round(calculated_qty)
+                        if abs(calculated_qty - rounded_qty) < 0.1:
+                            quantity = float(rounded_qty)
+                        else:
+                            quantity = calculated_qty
+                    elif quantity > total_price and calculated_qty >= 0.5:
+                        quantity = round(calculated_qty) if calculated_qty <= 100 else calculated_qty
+            
+            qty_str = f"{int(quantity)}" if quantity == int(quantity) else f"{quantity:g}"
+            price_str = f"{total_price:.2f}"
+            
+            items_data.append({
+                "name": name,
+                "qty": qty_str,
+                "price": price_str
+            })
+        
+        # Создаем временное изображение для вычисления размеров текста
+        temp_img = Image.new('RGB', (2000, 100), color='white')
+        temp_draw = ImageDraw.Draw(temp_img)
+        
+        # Вычисляем максимальную ширину названий товаров
+        max_name_width_px = 0
+        for item in items_data:
+            bbox = temp_draw.textbbox((0, 0), item["name"], font=font)
+            name_width_px = bbox[2] - bbox[0]
+            max_name_width_px = max(max_name_width_px, name_width_px)
+        
+        # Ширина колонок в пикселях (ориентируемся на таблицу)
+        name_col_width = max(max_name_width_px, 300)  # Минимум 300px для названия
+        qty_col_width = 100  # Увеличено для количества
+        price_col_width = 150
+        
+        # Ширина таблицы определяет ширину всего изображения
+        table_width = name_col_width + qty_col_width + price_col_width + 80  # 80px для отступов между колонками
+        total_width = table_width + padding * 2
+        
+        # Разбиваем название магазина на строки, если оно не помещается
+        store_lines = []
+        if store_text:
+            max_store_width = total_width - padding * 2  # Доступная ширина для текста
+            words = store_text.split()
+            current_line = ""
+            
+            for word in words:
+                test_line = current_line + (" " if current_line else "") + word
+                bbox = temp_draw.textbbox((0, 0), test_line, font=title_font)
+                test_width = bbox[2] - bbox[0]
+                
+                if test_width <= max_store_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        store_lines.append(current_line)
+                    current_line = word
+            
+            if current_line:
+                store_lines.append(current_line)
+        else:
+            store_lines = []
+        
+        # Вычисляем высоту
+        header_lines = len(store_lines)  # Название магазина может быть в несколько строк
+        if date_text:
+            header_lines += 1
+        header_lines += 1  # пустая строка
+        
+        table_lines = 2 + len(items_data) + 1  # заголовок + разделитель + строки + итог
+        total_height = padding * 2 + header_lines * line_height + table_lines * line_height
+        
+        # Создаем реальное изображение
+        img = Image.new('RGB', (total_width, total_height), color='white')
+        draw = ImageDraw.Draw(img)
+        
+        y = padding
+        x = padding
+        
+        # Рисуем заголовок магазина (может быть в несколько строк)
+        for store_line in store_lines:
+            draw.text((x, y), store_line, fill='black', font=title_font)
+            y += line_height
+        
+        # Рисуем дату
+        if date_text:
+            draw.text((x, y), date_text, fill='black', font=header_font)
+            y += line_height
+        
+        y += line_height // 2  # пустая строка
+        
+        # Вычисляем позиции колонок
+        name_col_x = x
+        qty_col_x = x + name_col_width + 40  # 40px отступ между колонками
+        price_col_x = qty_col_x + qty_col_width + 40
+        
+        # Рисуем заголовок таблицы
+        draw.text((name_col_x, y), "Товар", fill='black', font=header_font)
+        draw.text((qty_col_x, y), "Кол-во", fill='black', font=header_font)
+        draw.text((price_col_x, y), "Сумма", fill='black', font=header_font)
+        y += line_height
+        
+        # Разделитель
+        draw.line([(x, y), (total_width - padding, y)], fill='gray', width=2)
+        y += line_height
+        
+        # Рисуем товары с правильным выравниванием
+        for item in items_data:
+            # Название товара (слева)
+            draw.text((name_col_x, y), item["name"], fill='black', font=font)
+            # Количество (по центру своей колонки)
+            qty_bbox = draw.textbbox((0, 0), item["qty"], font=font)
+            qty_text_width = qty_bbox[2] - qty_bbox[0]
+            qty_x = qty_col_x + (qty_col_width - qty_text_width) // 2  # Центрируем
+            draw.text((qty_x, y), item["qty"], fill='black', font=font)
+            # Цена (справа в своей колонке)
+            price_bbox = draw.textbbox((0, 0), item["price"], font=font)
+            price_text_width = price_bbox[2] - price_bbox[0]
+            price_x = price_col_x + (price_col_width - price_text_width)  # Выравниваем справа
+            draw.text((price_x, y), item["price"], fill='black', font=font)
+            y += line_height
+        
+        # Разделитель перед итогом
+        draw.line([(x, y), (total_width - padding, y)], fill='gray', width=2)
+        y += line_height
+        
+        # Итог
+        total_str = f"{parsed.total:.2f} {parsed.currency}"
+        draw.text((name_col_x, y), "ИТОГО", fill='black', font=header_font)
+        # Цена итога выравниваем справа
+        total_bbox = draw.textbbox((0, 0), total_str, font=header_font)
+        total_text_width = total_bbox[2] - total_bbox[0]
+        total_x = price_col_x + (price_col_width - total_text_width)  # Выравниваем справа
+        draw.text((total_x, y), total_str, fill='black', font=header_font)
+        
+        # Сохраняем в bytes
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG')
+        img_bytes.seek(0)
+        return img_bytes.getvalue()
+        
+    except Exception as exc:
+        logging.exception(f"Ошибка при генерации изображения чека: {exc}")
+        return None
 
 
 def format_statement_summary(transactions: List[ParsedBankTransaction]) -> str:
