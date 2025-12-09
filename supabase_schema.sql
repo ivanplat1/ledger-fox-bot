@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS expenses (
     expense_hash TEXT UNIQUE NOT NULL,
     status TEXT DEFAULT 'pending_review', -- 'pending_review', 'approved', 'rejected'
     period TEXT, -- формат: 'YYYY-MM' для группировки
+    category TEXT, -- категория расхода (из товаров чека или вручную)
     note TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()

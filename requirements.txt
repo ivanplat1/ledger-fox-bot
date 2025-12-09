@@ -12,6 +12,7 @@ deep-translator>=1.11.4
 paddlepaddle>=2.6.0
 paddleocr>=2.7.0
 pyzbar>=0.1.9
+qreader>=3.10.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 

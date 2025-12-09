@@ -1,0 +1,11 @@
+fix: update validation labels and restore expense categories
+
+- Change "Тотал" to "Итого" in validation messages for better UX
+- Add error handling for missing category column in expenses table
+- Restore category logic for expenses: determine category from receipt items
+- Restore category breakdown in monthly reports
+
+The category is determined by taking the most frequent category from receipt items.
+If the category column is missing in the database, the code will automatically
+retry without it to prevent errors.
+

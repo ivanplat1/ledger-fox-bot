@@ -9,7 +9,7 @@ import mimetypes
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +19,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from dotenv import load_dotenv
 import requests
 
@@ -85,6 +85,16 @@ except (ModuleNotFoundError, ImportError, OSError):  # pragma: no cover - import
     QR_READER_AVAILABLE = False
     logging.warning("pyzbar недоступен (установите zbar: brew install zbar на macOS)")
 
+try:
+    from qreader import QReader
+    QREADER_AVAILABLE = True
+    qreader_instance = QReader()
+except (ModuleNotFoundError, ImportError):  # pragma: no cover - import guard
+    QReader = None  # type: ignore
+    qreader_instance = None  # type: ignore
+    QREADER_AVAILABLE = False
+    logging.warning("qreader недоступен (установите: pip install qreader)")
+
 
 load_dotenv()
 log_level_name = os.getenv("LEDGERFOX_LOG_LEVEL", "INFO").upper()
@@ -107,6 +117,10 @@ class ReceiptStates(StatesGroup):
 
 class StatementStates(StatesGroup):
     waiting_for_statement = State()
+
+
+class DeleteStates(StatesGroup):
+    waiting_for_confirmation = State()
 
 
 @dataclass
@@ -171,28 +185,35 @@ class Snapshot:
     description: str
 
 
+# Базовый промпт для извлечения данных чека (общий для изображений и URL)
+RECEIPT_BASE_PROMPT = (
+    "Верни только JSON без комментариев со следующей структурой: "
+    "{\"store\": str, \"merchant_address\": str | null, "
+    "\"purchased_at\": iso8601 datetime (UTC или локальная зона), \"currency\": ISO4217, "
+    "\"total\": float, \"tax_amount\": float | null, "
+    "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
+    "\n\nВАЖНО: "
+    "- \"quantity\" - это количество товара (например, 2, 3, 1.5)"
+    "- \"price\" - это ОБЩАЯ сумма за позицию (количество × цена за единицу), а не цена за единицу"
+    "- Для каждого товара определи категорию на основе его названия. "
+    "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
+    "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
+    "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
+    "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
+    "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
+    "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
+    "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
+    "Если категория не очевидна, используй \"Другое\"."
+)
+
 RECEIPT_EXTRACTION_PROMPT = os.getenv(
     "RECEIPT_OCR_PROMPT",
-    (
-        "Ты извлекаешь данные из фото кассовых чеков. Верни только JSON без комментариев "
-        "со следующей структурой: {\"store\": str, \"merchant_address\": str | null, "
-        "\"purchased_at\": iso8601 datetime (UTC или локальная зона), \"currency\": ISO4217, "
-        "\"total\": float, \"tax_amount\": float | null, "
-        "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
-        " Если в чеке нет позиции, всё равно верни items c хотя бы одной строкой и ставь приблизительные значения."
-        "\n\nВАЖНО: "
-        "- \"quantity\" - это количество товара (например, 2, 3, 1.5)"
-        "- \"price\" - это ОБЩАЯ сумма за позицию (количество × цена за единицу), а не цена за единицу"
-        "- Для каждого товара определи категорию на основе его названия. "
-        "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
-        "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
-        "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
-        "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
-        "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
-        "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
-        "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
-        "Если категория не очевидна, используй \"Другое\"."
-    ),
+    f"Ты извлекаешь данные из фото кассовых чеков. {RECEIPT_BASE_PROMPT}",
+).strip()
+
+RECEIPT_DATA_STRUCTURING_PROMPT = os.getenv(
+    "RECEIPT_DATA_PROMPT",
+    f"Ты получаешь данные чека, которые были извлечены с веб-страницы. Структурируй и улучши эти данные, определи категории товаров. {RECEIPT_BASE_PROMPT}",
 ).strip()
 RECEIPT_MODEL = os.getenv("RECEIPT_OCR_MODEL", "gpt-4o").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -277,6 +298,7 @@ class ReceiptParserAI:
         model: str = RECEIPT_MODEL,
         base_url: str = OPENAI_BASE_URL,
         prompt: str = RECEIPT_EXTRACTION_PROMPT,
+        data_prompt: str = RECEIPT_DATA_STRUCTURING_PROMPT,
         temperature: float = RECEIPT_TEMPERATURE,
         timeout: int = DEFAULT_RECEIPT_TIMEOUT,
     ) -> None:
@@ -286,18 +308,30 @@ class ReceiptParserAI:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.prompt = prompt
+        self.data_prompt = data_prompt
         self.temperature = temperature
         self.timeout = timeout
         self._session = requests.Session()
 
-    async def parse(self, file_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+    async def parse(
+        self, 
+        file_bytes: bytes, 
+        mime_type: str, 
+        qr_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Отправляет изображение в OpenAI и возвращает полный JSON response без изменений.
+        Если передан qr_data, отправляются данные для структурирования (без изображения).
         """
-        if not mime_type.startswith("image/"):
-            raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-        data_url = build_data_url(file_bytes, mime_type)
-        payload = self._build_payload(data_url)
+        # Если есть данные из QR-кода, отправляем их для структурирования
+        if qr_data:
+            logging.info("Используем данные из QR-кода для структурирования, изображение не отправляется")
+            payload = self._build_payload("", qr_data=qr_data)
+        else:
+            if not mime_type.startswith("image/"):
+                raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
+            data_url = build_data_url(file_bytes, mime_type)
+            payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -380,40 +414,74 @@ class ReceiptParserAI:
         
         return response_json
 
-    def _build_payload(self, data_url: str) -> Dict[str, Any]:
+    def _build_payload(
+        self, 
+        data_url: str, 
+        qr_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         # OpenAI автоматически кэширует системные промпты >= 1024 токенов
-        # Для лучшего кэширования используем prompt_cache_key
-        payload = {
-            "model": self.model,
-            "response_format": {"type": "json_object"},
-            "temperature": self.temperature,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": self.prompt,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Извлеки данные чека и верни JSON.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url},
-                        },
-                    ],
-                },
-            ],
-        }
+        # Используем единый базовый промпт для лучшего кэширования
+        # Разница только в начале промпта (про фото или про URL), остальное одинаково
+        
+        import hashlib
+        import json
+        
+        # Если есть данные из QR-кода, отправляем их для структурирования
+        if qr_data is not None:
+            user_text = f"Вот данные чека, которые были извлечены с веб-страницы:\n\n{json.dumps(qr_data, ensure_ascii=False, indent=2)}\n\nСтруктурируй эти данные и верни JSON с правильными категориями товаров."
+            logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
+            
+            # Используем промпт для структурирования данных
+            system_prompt = self.data_prompt
+            payload = {
+                "model": self.model,
+                "response_format": {"type": "json_object"},
+                "temperature": self.temperature,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_text,
+                    },
+                ],
+            }
+        else:
+            # Если нет URL, отправляем изображение как обычно
+            user_text = "Извлеки данные чека и верни JSON."
+            system_prompt = self.prompt
+            payload = {
+                "model": self.model,
+                "response_format": {"type": "json_object"},
+                "temperature": self.temperature,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": user_text,
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                        ],
+                    },
+                ],
+            }
         
         # Добавляем prompt_cache_key для лучшего кэширования
-        # Это помогает OpenAI лучше маршрутизировать запросы с одинаковыми префиксами
         # Используем хеш системного промпта как ключ кэша
-        import hashlib
-        prompt_hash = hashlib.md5(self.prompt.encode()).hexdigest()[:16]
-        payload["prompt_cache_key"] = f"receipt_system_{prompt_hash}"
+        # Оба промпта имеют одинаковую базовую часть (RECEIPT_BASE_PROMPT), что улучшает кэширование
+        prompt_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:16]
+        payload["prompt_cache_key"] = f"receipt_{prompt_hash}"
         
         return payload
 
@@ -500,7 +568,105 @@ class SupabaseGateway:
             "transaction_hash",
         )
 
-    async def record_expense(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def check_duplicate_expense(self, user_id: int, date: str, amount: float, currency: str, tolerance_days: int = 1, tolerance_percent: float = 0.01) -> bool:
+        """
+        Проверяет, есть ли уже расход с похожей датой и суммой.
+        tolerance_days - допустимое отклонение по дате (дни)
+        tolerance_percent - допустимое отклонение по сумме (например, 0.01 = 1%)
+        """
+        try:
+            # Парсим дату (может быть ISO строка или просто дата)
+            try:
+                if 'T' in date or '+' in date or 'Z' in date:
+                    date_obj = datetime.fromisoformat(date.replace('Z', '+00:00'))
+                else:
+                    # Просто дата без времени
+                    date_obj = datetime.fromisoformat(date)
+            except (ValueError, AttributeError):
+                # Если не удалось распарсить, пробуем другой формат
+                try:
+                    date_obj = datetime.strptime(date[:10], "%Y-%m-%d")
+                except:
+                    logging.warning(f"Could not parse date: {date}")
+                    return False
+            
+            date_center = date_obj.date() if hasattr(date_obj, 'date') else date_obj
+            date_start = date_center - timedelta(days=tolerance_days)
+            date_end = date_center + timedelta(days=tolerance_days)
+            
+            # Вычисляем диапазон сумм
+            amount_min = amount * (1 - tolerance_percent)
+            amount_max = amount * (1 + tolerance_percent)
+            
+            # Ищем похожие расходы (по дате и сумме)
+            # Используем gte/lte для даты и суммы
+            result = (
+                self._client.table(self.expenses_table)
+                .select("id,date,amount,currency,source")
+                .eq("user_id", user_id)
+                .eq("currency", currency)
+                .gte("amount", amount_min)
+                .lte("amount", amount_max)
+                .gte("date", date_start.isoformat())
+                .lte("date", date_end.isoformat())
+                .execute()
+            )
+            
+            if result.data:
+                # Проверяем каждый найденный расход
+                for existing in result.data:
+                    existing_date_str = existing.get("date", "")
+                    existing_amount = existing.get("amount", 0.0)
+                    existing_source = existing.get("source", "")
+                    
+                    if not existing_date_str or not existing_amount:
+                        continue
+                    
+                    try:
+                        # Парсим дату существующего расхода
+                        if 'T' in existing_date_str or '+' in existing_date_str or 'Z' in existing_date_str:
+                            existing_date_obj = datetime.fromisoformat(existing_date_str.replace('Z', '+00:00'))
+                        else:
+                            existing_date_obj = datetime.fromisoformat(existing_date_str)
+                        
+                        existing_date = existing_date_obj.date() if hasattr(existing_date_obj, 'date') else existing_date_obj
+                        
+                        # Проверяем, что дата и сумма в пределах допуска
+                        if date_start <= existing_date <= date_end and amount_min <= existing_amount <= amount_max:
+                            logging.info(
+                                f"Found duplicate expense: existing={existing_source} date={existing_date_str} amount={existing_amount}, "
+                                f"new date={date} amount={amount}"
+                            )
+                            return True
+                    except Exception as e:
+                        logging.debug(f"Error parsing existing date {existing_date_str}: {e}")
+                        continue
+            
+            return False
+        except Exception as exc:
+            logging.exception(f"Error checking duplicate expense: {exc}")
+            return False
+
+    async def record_expense(self, payload: Dict[str, Any], check_duplicates: bool = True) -> Dict[str, Any]:
+        """
+        Сохраняет расход в базу данных.
+        check_duplicates - проверять ли дубликаты по дате и сумме перед сохранением.
+        """
+        user_id = payload.get("user_id")
+        date = payload.get("date")
+        amount = payload.get("amount")
+        currency = payload.get("currency")
+        
+        # Проверяем дубликаты, если включено
+        if check_duplicates and user_id and date and amount and currency:
+            is_duplicate = await self.check_duplicate_expense(user_id, date, amount, currency)
+            if is_duplicate:
+                logging.info(
+                    f"Skipping duplicate expense: user={user_id} date={date} amount={amount} {currency}"
+                )
+                # Возвращаем пустой словарь или None, чтобы показать, что запись не была создана
+                return {"duplicate": True}
+        
         logging.info(
             "Recording expense user=%s source=%s",
             payload.get("user_id"),
@@ -529,6 +695,17 @@ class SupabaseGateway:
             period,
         )
 
+    async def delete_all_user_data(self, user_id: int) -> Dict[str, int]:
+        """
+        Удаляет все данные пользователя из всех таблиц.
+        Возвращает словарь с количеством удаленных записей по таблицам.
+        """
+        logging.warning(f"Deleting all data for user={user_id}")
+        return await asyncio.to_thread(
+            self._delete_all_user_data_sync,
+            user_id,
+        )
+
     def _table_upsert(self, table: str, payload: Dict[str, Any], on_conflict: str) -> Dict[str, Any]:
         try:
             result = (
@@ -543,6 +720,28 @@ class SupabaseGateway:
                 logging.warning(f"⚠️ Supabase вернул пустой результат для {table}, используем payload")
                 return payload
         except Exception as exc:
+            # Если ошибка связана с отсутствующей колонкой category, пробуем без неё
+            error_str = str(exc)
+            if "category" in error_str.lower() and "column" in error_str.lower():
+                logging.warning(f"⚠️ Колонка 'category' отсутствует в таблице {table}, пробуем без неё")
+                payload_without_category = {k: v for k, v in payload.items() if k != "category"}
+                try:
+                    result = (
+                        self._client.table(table)
+                        .upsert(payload_without_category, on_conflict=on_conflict, returning="representation")
+                        .execute()
+                    )
+                    if result.data and len(result.data) > 0:
+                        logging.info(f"✅ Успешно сохранено в {table} (без category): {result.data[0].get('id')}")
+                        return result.data[0]
+                    else:
+                        logging.warning(f"⚠️ Supabase вернул пустой результат для {table}, используем payload")
+                        return payload_without_category
+                except Exception as retry_exc:
+                    logging.exception(f"❌ Ошибка при повторной попытке сохранения в {table}: {retry_exc}")
+                    logging.error(f"Payload: {json.dumps(payload_without_category, ensure_ascii=False, default=str)}")
+                    raise
+            
             logging.exception(f"❌ Ошибка при сохранении в {table}: {exc}")
             logging.error(f"Payload: {json.dumps(payload, ensure_ascii=False, default=str)}")
             raise
@@ -571,7 +770,38 @@ class SupabaseGateway:
             or []
         )
         total = sum(entry.get("amount", 0.0) for entry in data)
-        return {"period": period, "total": total, "entries": data}
+        
+        # Разбивка по категориям
+        categories = {}
+        for entry in data:
+            category = entry.get("category") or "Другое"
+            amount = entry.get("amount", 0.0)
+            categories[category] = categories.get(category, 0.0) + amount
+        
+        # Разбивка по магазинам
+        stores = {}
+        for entry in data:
+            store = entry.get("store") or "Без названия"
+            amount = entry.get("amount", 0.0)
+            stores[store] = stores.get(store, 0.0) + amount
+        
+        # Разбивка по дням
+        daily = {}
+        for entry in data:
+            date_str = entry.get("date", "")
+            if date_str:
+                day = date_str[:10]  # YYYY-MM-DD
+                amount = entry.get("amount", 0.0)
+                daily[day] = daily.get(day, 0.0) + amount
+        
+        return {
+            "period": period,
+            "total": total,
+            "entries": data,
+            "by_category": categories,
+            "by_store": stores,
+            "by_day": daily,
+        }
 
     def _export_expenses_csv_sync(self, user_id: int, period: Optional[str]) -> str:
         query = self._client.table(self.expenses_table).select("*").eq("user_id", user_id)
@@ -587,6 +817,58 @@ class SupabaseGateway:
         for row in data:
             writer.writerow({key: row.get(key) for key in fieldnames})
         return buffer.getvalue()
+
+    def _delete_all_user_data_sync(self, user_id: int) -> Dict[str, int]:
+        """
+        Синхронное удаление всех данных пользователя из всех таблиц.
+        """
+        result = {}
+        
+        # Удаляем из expenses
+        try:
+            expenses_result = (
+                self._client.table(self.expenses_table)
+                .delete()
+                .eq("user_id", user_id)
+                .execute()
+            )
+            result["expenses"] = len(expenses_result.data) if expenses_result.data else 0
+            logging.info(f"Deleted {result['expenses']} expenses for user={user_id}")
+        except Exception as exc:
+            logging.exception(f"Error deleting expenses for user={user_id}: {exc}")
+            result["expenses"] = 0
+        
+        # Удаляем из receipts
+        try:
+            receipts_result = (
+                self._client.table(self.receipts_table)
+                .delete()
+                .eq("user_id", user_id)
+                .execute()
+            )
+            result["receipts"] = len(receipts_result.data) if receipts_result.data else 0
+            logging.info(f"Deleted {result['receipts']} receipts for user={user_id}")
+        except Exception as exc:
+            logging.exception(f"Error deleting receipts for user={user_id}: {exc}")
+            result["receipts"] = 0
+        
+        # Удаляем из bank_transactions
+        try:
+            bank_result = (
+                self._client.table(self.bank_table)
+                .delete()
+                .eq("user_id", user_id)
+                .execute()
+            )
+            result["bank_transactions"] = len(bank_result.data) if bank_result.data else 0
+            logging.info(f"Deleted {result['bank_transactions']} bank transactions for user={user_id}")
+        except Exception as exc:
+            logging.exception(f"Error deleting bank transactions for user={user_id}: {exc}")
+            result["bank_transactions"] = 0
+        
+        total_deleted = sum(result.values())
+        logging.warning(f"Total deleted records for user={user_id}: {total_deleted}")
+        return result
 
 
 def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
@@ -636,6 +918,21 @@ class LedgerFoxBot:
 
     async def run(self) -> None:
         logging.info("Starting LedgerFox bot")
+        
+        # Настраиваем меню команд
+        commands = [
+            BotCommand(command="receipt", description="Добавить чек (фото)"),
+            BotCommand(command="expense", description="Добавить расход вручную"),
+            BotCommand(command="statement", description="Импортировать выписку"),
+            BotCommand(command="report", description="Получить отчёт"),
+            BotCommand(command="export", description="Экспорт данных в CSV"),
+            BotCommand(command="qr", description="Найти QR-коды на фото"),
+            BotCommand(command="delete_all", description="Удалить все данные"),
+            BotCommand(command="cancel", description="Отменить операцию"),
+        ]
+        await self.bot.set_my_commands(commands)
+        logging.info("Bot commands menu configured")
+        
         # Логируем информацию о доступных OCR движках
         ocr_status = []
         if TESSERACT_AVAILABLE:
@@ -782,12 +1079,68 @@ class LedgerFoxBot:
                 return
             period = datetime.utcnow().strftime("%Y-%m")
             report = await self.supabase.fetch_monthly_report(message.from_user.id, period)
-            total = report.get("total", 0.0)
+            
+            # Форматируем отчет с разбивкой
+            report_text = format_report(report)
+            
+            # Обрезаем если слишком длинный
+            truncated_report = truncate_message_for_telegram(report_text)
+            await message.answer(truncated_report)
+
+        @self.router.message(Command("delete_all"))
+        async def handle_delete_all(message: Message, state: FSMContext) -> None:
+            if not self.supabase:
+                await message.answer(
+                    "Удаление данных доступно только при подключенной базе (Supabase)."
+                )
+                return
+            
+            if not message.from_user:
+                await message.answer("Не удалось определить пользователя.")
+                return
+            
+            # Сохраняем user_id в state для подтверждения
+            await state.update_data(user_id=message.from_user.id)
+            await state.set_state(DeleteStates.waiting_for_confirmation)
+            
+            # Создаем кнопки для подтверждения
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⚠️ Да, удалить все данные", callback_data="delete_confirm"),
+                ],
+                [
+                    InlineKeyboardButton(text="❌ Отменить", callback_data="delete_cancel"),
+                ]
+            ])
+            
             await message.answer(
-                f"Отчёт за {period}:\n"
-                f"• Всего расходов: {total:.2f}\n"
-                "Подробнее смотри в своей Supabase таблице или экспортируй данные."
+                "⚠️ ВНИМАНИЕ!\n\n"
+                "Вы собираетесь удалить ВСЕ ваши данные:\n"
+                "• Все чеки\n"
+                "• Все расходы\n"
+                "• Все банковские транзакции\n\n"
+                "Это действие НЕОБРАТИМО!\n\n"
+                "Вы уверены?",
+                reply_markup=keyboard
             )
+
+        @self.router.message(Command("expense"))
+        async def handle_expense_entry(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            instructions = (
+                "💳 Добавление расхода вручную\n\n"
+                "Отправьте расход в формате:\n"
+                "• Название магазина/места сумма валюта\n"
+                "• Название магазина сумма валюта дата\n\n"
+                "Примеры:\n"
+                "• Кафе 500 руб\n"
+                "• Такси 1200 KZT\n"
+                "• Продукты 2500 руб 03.12\n"
+                "• Ресторан 5000 KZT 2025-12-03\n\n"
+                "Валюта определяется автоматически (RUB, KZT, USD и др.)\n"
+                "Если дата не указана, используется сегодняшняя."
+            )
+            await message.answer(instructions)
 
         @self.router.message(F.text)
         async def handle_text_expense(message: Message, state: FSMContext) -> None:
@@ -802,8 +1155,11 @@ class LedgerFoxBot:
                 return
             # SECURITY: удостовериться, что пользователь подтверждён, прежде чем писать в базу.
             payload = build_manual_expense_payload(message.from_user.id, parsed)
-            await self.supabase.record_expense(payload)
-            await message.answer("Расход добавлен вручную.")
+            expense_result = await self.supabase.record_expense(payload)
+            if expense_result.get("duplicate"):
+                await message.answer("⚠️ Расход не добавлен: найден дубликат с такой же датой и суммой.")
+            else:
+                await message.answer("✅ Расход добавлен вручную.")
 
         @self.router.callback_query(F.data == "receipt_confirm")
         async def handle_receipt_confirm(callback: CallbackQuery, state: FSMContext) -> None:
@@ -826,8 +1182,11 @@ class LedgerFoxBot:
                 else:
                     # Создаем expense запись из receipt только если это новый чек
                     expense_payload = build_expense_payload_from_receipt(stored_receipt)
-                    await self.supabase.record_expense(expense_payload)
-                    await callback.message.answer("✅ Чек сохранен в базу данных")
+                    expense_result = await self.supabase.record_expense(expense_payload)
+                    if expense_result.get("duplicate"):
+                        await callback.message.answer("✅ Чек сохранен в базу данных\n⚠️ Расход не создан: найден дубликат (возможно, уже есть в выписке)")
+                    else:
+                        await callback.message.answer("✅ Чек сохранен в базу данных")
                 await state.clear()
             except Exception as exc:
                 logging.exception(f"Ошибка при сохранении чека: {exc}")
@@ -839,6 +1198,53 @@ class LedgerFoxBot:
             """Обработчик отклонения чека"""
             await callback.answer()
             await callback.message.answer("Понял, отправьте фото чека заново для переснятия.")
+            await state.clear()
+
+        @self.router.callback_query(F.data == "delete_confirm")
+        async def handle_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик подтверждения удаления всех данных"""
+            await callback.answer()
+            
+            if not self.supabase or not callback.from_user:
+                await callback.message.answer("Ошибка: база данных не подключена или не удалось определить пользователя.")
+                await state.clear()
+                return
+            
+            # Проверяем, что user_id из state совпадает с user_id из callback
+            data = await state.get_data()
+            stored_user_id = data.get("user_id")
+            
+            if stored_user_id != callback.from_user.id:
+                await callback.message.answer("Ошибка: несоответствие пользователя.")
+                await state.clear()
+                return
+            
+            try:
+                # Удаляем все данные пользователя
+                await callback.message.answer("Удаляю все данные...")
+                result = await self.supabase.delete_all_user_data(callback.from_user.id)
+                
+                total_deleted = sum(result.values())
+                message_text = (
+                    f"✅ Все данные удалены!\n\n"
+                    f"Удалено записей:\n"
+                    f"• Чеков: {result.get('receipts', 0)}\n"
+                    f"• Расходов: {result.get('expenses', 0)}\n"
+                    f"• Банковских транзакций: {result.get('bank_transactions', 0)}\n\n"
+                    f"Всего: {total_deleted}"
+                )
+                await callback.message.answer(message_text)
+            except Exception as exc:
+                logging.exception(f"Ошибка при удалении данных: {exc}")
+                await callback.message.answer(f"⚠️ Ошибка при удалении данных: {str(exc)[:200]}")
+            finally:
+                await state.clear()
+
+        @self.router.callback_query(F.data == "delete_cancel")
+        async def handle_delete_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик отмены удаления данных"""
+            await callback.answer()
+            await callback.message.answer("Удаление отменено. Ваши данные сохранены.")
             await state.clear()
 
     async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
@@ -871,6 +1277,27 @@ class LedgerFoxBot:
                     # Отправляем изображение
                     photo = BufferedInputFile(img_bytes, filename="receipt.png")
                     await message.answer_photo(photo, reply_markup=keyboard)
+                    
+                    # Отправляем результат валидации отдельным сообщением
+                    items_sum = sum(item.price for item in result.parsed_receipt.items)
+                    total = result.parsed_receipt.total or 0.0
+                    difference = abs(items_sum - total)
+                    tolerance = max(total * 0.01, 1.0)
+                    
+                    if difference > tolerance:
+                        validation_text = (
+                            f"⚠️ Несоответствие суммы:\n"
+                            f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
+                            f"Итого: {total:.2f} {result.parsed_receipt.currency}\n"
+                            f"Разница: {difference:.2f} {result.parsed_receipt.currency}"
+                        )
+                    else:
+                        validation_text = (
+                            f"✅ Валидация пройдена:\n"
+                            f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
+                            f"Итого: {total:.2f} {result.parsed_receipt.currency}"
+                        )
+                    await message.answer(validation_text)
                     
                     # Добавляем дополнительную информацию текстом, если есть
                     additional_info = ""
@@ -916,88 +1343,37 @@ class LedgerFoxBot:
         qr_codes = read_qr_codes(file_bytes)
         logging.info(f"Найдено QR-кодов: {len(qr_codes)}")
         
-        # Если есть QR-код с URL, пытаемся получить данные оттуда
+        # Переменная для хранения данных из QR-кода для отправки в OpenAI
+        qr_data_from_url = None
+        
+        # Если есть QR-код или штрих-код с URL, пытаемся получить данные оттуда
         if qr_codes:
+            # Сначала ищем QR-коды с URL (игнорируем CODE39 и другие не-URL коды)
             for qr in qr_codes:
                 qr_data = qr.get("data", "")
-                logging.info(f"Проверяем QR-код: {qr_data[:100]}... (тип: {qr.get('type')})")
+                qr_type = qr.get("type", "")
                 
+                # Игнорируем CODE39 и другие штрих-коды, которые не являются URL
+                if qr_type == "CODE39" or (not is_url(qr_data) and qr_type != "QRCODE"):
+                    logging.info(f"Игнорируем код типа {qr_type}: {qr_data[:50]}... (не URL и не QR-код)")
+                    continue
+                
+                logging.info(f"Проверяем код: {qr_data[:100]}... (тип: {qr_type})")
+                
+                # Проверяем, является ли это URL
                 if is_url(qr_data):
-                    logging.info(f"✅ Найден QR-код с URL: {qr_data}")
-                    receipt_data = await fetch_receipt_from_qr_url(qr_data)
-                    
-                    if receipt_data:
-                        # Успешно получили данные из QR-кода
-                        logging.info("✅ Данные чека получены из QR-кода, отправляем в OpenAI для улучшения")
-                        
-                        # Отправляем данные в OpenAI для улучшения (без изображения)
-                        try:
-                            response_json = await improve_receipt_data_with_ai(receipt_data)
-                            
-                            # Извлекаем улучшенные данные
-                            choices = response_json.get("choices", [])
-                            final_data = receipt_data
-                            if choices:
-                                ai_message = choices[0].get("message", {})
-                                content = ai_message.get("content", "")
-                                if content:
-                                    try:
-                                        final_data = json.loads(content)
-                                    except json.JSONDecodeError:
-                                        # Если не удалось распарсить, используем исходные данные
-                                        final_data = receipt_data
-                            
-                            # Парсим в ParsedReceipt и форматируем таблицу
-                            parsed_receipt = build_parsed_receipt(final_data)
-                            receipt_table = format_receipt_table(parsed_receipt)
-                            
-                            # Подготавливаем данные для сохранения (но не сохраняем сразу)
-                            receipt_payload = None
-                            if self.supabase and message.from_user:
-                                try:
-                                    receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                                    logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
-                                except Exception as db_exc:
-                                    logging.exception(f"Ошибка при создании payload: {db_exc}")
-                            
-                            # Добавляем информацию о QR-коде
-                            qr_info = f"\n\n📱 Данные получены из QR-кода и улучшены через OpenAI: {qr_data}"
-                            
-                            summary = receipt_table + qr_info
-                            
-                            return ProcessingResult(
-                                success=True,
-                                summary=summary,
-                                parsed_receipt=parsed_receipt,
-                                receipt_payload=receipt_payload,
-                            )
-                        except Exception as exc:
-                            logging.exception(f"Ошибка при улучшении данных через OpenAI: {exc}")
-                            # Если не удалось улучшить, используем исходные данные
-                            parsed_receipt = build_parsed_receipt(receipt_data)
-                            receipt_table = format_receipt_table(parsed_receipt)
-                            
-                            # Подготавливаем данные для сохранения (но не сохраняем сразу)
-                            receipt_payload = None
-                            if self.supabase and message.from_user:
-                                try:
-                                    receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
-                                    logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
-                                except Exception as db_exc:
-                                    logging.exception(f"Ошибка при создании payload: {db_exc}")
-                            
-                            qr_info = f"\n\n📱 Данные получены из QR-кода (без улучшения через OpenAI): {qr_data}"
-                            summary = receipt_table + qr_info
-                            return ProcessingResult(
-                                success=True,
-                                summary=summary,
-                                parsed_receipt=parsed_receipt,
-                                receipt_payload=receipt_payload,
-                            )
+                    logging.info(f"✅ Найден код с URL (тип: {qr_type}): {qr_data}")
+                    # Пытаемся получить данные с URL
+                    qr_data_from_url = await fetch_receipt_from_qr_url(qr_data)
+                    if qr_data_from_url:
+                        logging.info(f"✅ Получены данные с URL, отправляем их в OpenAI для структурирования")
                     else:
-                        logging.warning(f"⚠️ Не удалось получить данные из QR-кода: {qr_data}, используем OpenAI")
+                        logging.warning(f"⚠️ Не удалось получить данные с URL, используем изображение")
+                        qr_data_from_url = None  # Сброс, чтобы использовать изображение
+                    # Если найден QR-код с URL, игнорируем все остальные коды
+                    break
                 else:
-                    logging.info(f"QR-код не является URL: {qr_data[:50]}...")
+                    logging.info(f"QR-код не является URL: {qr_data[:50]}... (тип: {qr_type})")
         
         # Если QR-кода нет или не удалось получить данные, используем OpenAI
         try:
@@ -1013,9 +1389,13 @@ class LedgerFoxBot:
             else:
                 mime_type = "image/jpeg"
             
-            # Отправляем в OpenAI
-            logging.info("Starting OpenAI receipt parsing...")
-            response_json = await parse_receipt_with_ai(file_bytes, mime_type)
+            # Отправляем в OpenAI (с данными из QR-кода, если есть, иначе с изображением)
+            if qr_data_from_url:
+                logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
+                response_json = await parse_receipt_with_ai(file_bytes, mime_type, qr_data=qr_data_from_url)
+            else:
+                logging.info("Starting OpenAI receipt parsing...")
+                response_json = await parse_receipt_with_ai(file_bytes, mime_type)
             
             # Извлекаем только content из message и информацию о токенах
             try:
@@ -1053,6 +1433,34 @@ class LedgerFoxBot:
                 # Преобразуем в ParsedReceipt для форматирования
                 parsed_receipt = build_parsed_receipt(content_json)
                 
+                # Проверяем правильность распознавания: сумма позиций должна совпадать с тоталом
+                items_sum = sum(item.price for item in parsed_receipt.items)
+                total = parsed_receipt.total or 0.0
+                difference = abs(items_sum - total)
+                
+                # Допускаем погрешность до 1% или 1 единицу валюты (что больше)
+                tolerance = max(total * 0.01, 1.0)
+                
+                validation_message = ""
+                if difference > tolerance:
+                    validation_message = (
+                        f"\n\n⚠️ Несоответствие суммы:\n"
+                        f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                        f"Итого: {total:.2f} {parsed_receipt.currency}\n"
+                        f"Разница: {difference:.2f} {parsed_receipt.currency}"
+                    )
+                    logging.warning(
+                        f"⚠️ Несоответствие суммы: сумма позиций={items_sum:.2f}, "
+                        f"итого={total:.2f}, разница={difference:.2f} (допустимо {tolerance:.2f})"
+                    )
+                else:
+                    validation_message = (
+                        f"\n\n✅ Валидация пройдена:\n"
+                        f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                        f"Итого: {total:.2f} {parsed_receipt.currency}"
+                    )
+                    logging.info(f"✅ Сумма позиций совпадает с итого: {items_sum:.2f} = {total:.2f}")
+                
                 # Форматируем чек в виде таблицы
                 receipt_table = format_receipt_table(parsed_receipt)
                 
@@ -1067,7 +1475,7 @@ class LedgerFoxBot:
                 cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
                 
                 # Формируем итоговый ответ
-                summary = receipt_table
+                summary = receipt_table + validation_message
                 
                 # Добавляем информацию о QR-кодах, если они были найдены
                 if qr_codes:
@@ -1118,8 +1526,34 @@ class LedgerFoxBot:
                                 try:
                                     fallback_data = json.loads(content)
                                     parsed_receipt = build_parsed_receipt(fallback_data)
+                                    
+                                    # Проверяем правильность распознавания: сумма позиций должна совпадать с тоталом
+                                    items_sum = sum(item.price for item in parsed_receipt.items)
+                                    total = parsed_receipt.total or 0.0
+                                    difference = abs(items_sum - total)
+                                    tolerance = max(total * 0.01, 1.0)
+                                    
+                                    validation_message = ""
+                                    if difference > tolerance:
+                                        validation_message = (
+                                            f"\n\n⚠️ Несоответствие суммы:\n"
+                                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                                            f"Итого: {total:.2f} {parsed_receipt.currency}\n"
+                                            f"Разница: {difference:.2f} {parsed_receipt.currency}"
+                                        )
+                                        logging.warning(
+                                            f"⚠️ Несоответствие суммы (fallback): сумма позиций={items_sum:.2f}, "
+                                            f"итого={total:.2f}, разница={difference:.2f}"
+                                        )
+                                    else:
+                                        validation_message = (
+                                            f"\n\n✅ Валидация пройдена:\n"
+                                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                                            f"Итого: {total:.2f} {parsed_receipt.currency}"
+                                        )
+                                    
                                     # Форматируем в таблицу
-                                    response_str = format_receipt_table(parsed_receipt)
+                                    response_str = format_receipt_table(parsed_receipt) + validation_message
                                     
                                     # Подготавливаем данные для сохранения (но не сохраняем сразу)
                                     receipt_payload = None
@@ -1602,6 +2036,63 @@ def generate_receipt_image(parsed: ParsedReceipt) -> Optional[bytes]:
     except Exception as exc:
         logging.exception(f"Ошибка при генерации изображения чека: {exc}")
         return None
+
+
+def format_report(report: Dict[str, Any]) -> str:
+    """
+    Форматирует отчет с разбивкой по категориям, топ категорий/магазинов и графиком по дням.
+    """
+    period = report.get("period", "")
+    total = report.get("total", 0.0)
+    by_category = report.get("by_category", {})
+    by_store = report.get("by_store", {})
+    by_day = report.get("by_day", {})
+    
+    lines = [f"📊 Отчёт за {period}"]
+    lines.append(f"💰 Всего расходов: {total:.2f}")
+    lines.append("")
+    
+    # Разбивка по категориям
+    if by_category:
+        lines.append("📂 По категориям:")
+        sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
+        for category, amount in sorted_categories[:10]:  # Топ 10
+            percentage = (amount / total * 100) if total > 0 else 0
+            lines.append(f"  • {category}: {amount:.2f} ({percentage:.1f}%)")
+        lines.append("")
+    
+    # Топ магазинов
+    if by_store:
+        lines.append("🏪 Топ магазинов:")
+        sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
+        for store, amount in sorted_stores[:5]:  # Топ 5
+            percentage = (amount / total * 100) if total > 0 else 0
+            store_name = store[:40] if len(store) > 40 else store
+            lines.append(f"  • {store_name}: {amount:.2f} ({percentage:.1f}%)")
+        lines.append("")
+    
+    # График расходов по дням
+    if by_day:
+        lines.append("📈 Расходы по дням:")
+        sorted_days = sorted(by_day.items())
+        if sorted_days:
+            max_amount = max(by_day.values())
+            max_bar_length = 30
+            
+            for day, amount in sorted_days:
+                # Форматируем дату
+                try:
+                    date_obj = datetime.strptime(day, "%Y-%m-%d")
+                    day_str = date_obj.strftime("%d.%m")
+                except:
+                    day_str = day
+                
+                # Создаем текстовый график
+                bar_length = int((amount / max_amount * max_bar_length)) if max_amount > 0 else 0
+                bar = "█" * bar_length
+                lines.append(f"  {day_str}: {bar} {amount:.2f}")
+    
+    return "\n".join(lines)
 
 
 def format_statement_summary(transactions: List[ParsedBankTransaction]) -> str:
@@ -4064,10 +4555,14 @@ def get_receipt_parser() -> "ReceiptParserAI":
     return _receipt_parser
 
 
-async def parse_receipt_with_ai(file_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+async def parse_receipt_with_ai(
+    file_bytes: bytes, 
+    mime_type: str, 
+    qr_data: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """Отправляет изображение в OpenAI и возвращает полный JSON response."""
     parser = get_receipt_parser()
-    return await parser.parse(file_bytes, mime_type)
+    return await parser.parse(file_bytes, mime_type, qr_data=qr_data)
 
 
 async def improve_receipt_data_with_ai(receipt_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -4083,12 +4578,13 @@ def build_data_url(file_bytes: bytes, mime_type: str) -> str:
 
 def read_qr_codes(file_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Читает QR-коды из изображения.
-    Возвращает список словарей с данными о найденных QR-кодах.
+    Читает QR-коды и штрих-коды из изображения.
+    Возвращает список словарей с данными о найденных кодах.
+    Пробует несколько вариантов обработки изображения для лучшего распознавания.
+    Использует pyzbar, OpenCV QRCodeDetector и OCR как резервные методы.
     """
-    if not QR_READER_AVAILABLE or pyzbar_decode is None:
-        logging.warning("pyzbar не установлен, чтение QR-кодов недоступно")
-        return []
+    all_results = []
+    seen_data = set()  # Чтобы избежать дубликатов
     
     if Image is None:
         logging.warning("Pillow не установлен, чтение QR-кодов недоступно")
@@ -4102,35 +4598,326 @@ def read_qr_codes(file_bytes: bytes) -> List[Dict[str, Any]]:
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Читаем QR-коды
-        qr_codes = pyzbar_decode(image)
+        # Метод 1: pyzbar (если доступен)
+        if QR_READER_AVAILABLE and pyzbar_decode is not None:
+            # Пробуем несколько вариантов обработки изображения
+            # Увеличиваем изображение для лучшего распознавания QR-кодов
+            image_large = image.resize((image.width * 3, image.height * 3), Image.Resampling.LANCZOS)
+            image_very_large = image.resize((image.width * 4, image.height * 4), Image.Resampling.LANCZOS)
+            
+            variants = [
+                ("original", image),
+                ("grayscale", image.convert("L").convert("RGB")),
+                ("enhanced", ImageOps.autocontrast(image)),
+                ("enhanced_large", ImageOps.autocontrast(image_large)),
+                ("large", image_large),
+                ("very_large", image_very_large),
+                ("sharp", image.filter(ImageFilter.SHARPEN) if ImageFilter is not None else image),
+            ]
+            
+            for variant_name, processed_image in variants:
+                try:
+                    # Читаем коды из обработанного изображения
+                    codes = pyzbar_decode(processed_image)
+                    
+                    for code in codes:
+                        try:
+                            data = code.data.decode("utf-8")
+                            code_type = code.type
+                            
+                            # Игнорируем CODE39 и другие штрих-коды, которые не являются URL
+                            # Они не несут полезной информации для нас
+                            if code_type == "CODE39" and not is_url(data):
+                                logging.debug(f"Игнорируем CODE39 (не URL): {data[:50]}...")
+                                continue
+                            
+                            # Пропускаем дубликаты
+                            if data in seen_data:
+                                continue
+                            seen_data.add(data)
+                            
+                            rect = code.rect
+                            result = {
+                                "data": data,
+                                "type": code_type,
+                                "rect": {
+                                    "left": rect.left,
+                                    "top": rect.top,
+                                    "width": rect.width,
+                                    "height": rect.height,
+                                },
+                            }
+                            all_results.append(result)
+                            logging.info(f"Найден код типа {code_type} (pyzbar, вариант {variant_name}): {data[:100]}...")
+                        except UnicodeDecodeError:
+                            # Пробуем другие кодировки
+                            try:
+                                data = code.data.decode("latin-1")
+                                if data not in seen_data:
+                                    seen_data.add(data)
+                                    code_type = code.type
+                                    rect = code.rect
+                                    result = {
+                                        "data": data,
+                                        "type": code_type,
+                                        "rect": {
+                                            "left": rect.left,
+                                            "top": rect.top,
+                                            "width": rect.width,
+                                            "height": rect.height,
+                                        },
+                                    }
+                                    all_results.append(result)
+                                    logging.info(f"Найден код типа {code_type} (latin-1, вариант {variant_name}): {data[:100]}...")
+                            except Exception:
+                                continue
+                except Exception as exc:
+                    logging.debug(f"Ошибка при обработке варианта {variant_name}: {exc}")
+                    continue
+            
+            # Если ничего не найдено, пробуем с OpenCV для улучшения контраста
+            if not all_results and cv2 is not None:
+                try:
+                    import numpy as np
+                    # Конвертируем PIL в numpy array
+                    img_array = np.array(image)
+                    # Конвертируем RGB в BGR для OpenCV
+                    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                    
+                    # Пробуем улучшить контраст
+                    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                    # Адаптивная бинаризация
+                    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+                    # Конвертируем обратно в RGB для pyzbar
+                    adaptive_rgb = cv2.cvtColor(adaptive, cv2.COLOR_GRAY2RGB)
+                    adaptive_pil = Image.fromarray(adaptive_rgb)
+                    
+                    codes = pyzbar_decode(adaptive_pil)
+                    for code in codes:
+                        try:
+                            data = code.data.decode("utf-8")
+                            if data not in seen_data:
+                                seen_data.add(data)
+                                code_type = code.type
+                                rect = code.rect
+                                result = {
+                                    "data": data,
+                                    "type": code_type,
+                                    "rect": {
+                                        "left": rect.left,
+                                        "top": rect.top,
+                                        "width": rect.width,
+                                        "height": rect.height,
+                                    },
+                                }
+                                all_results.append(result)
+                                logging.info(f"Найден код типа {code_type} (OpenCV+pyzbar): {data[:100]}...")
+                        except Exception:
+                            continue
+                except Exception as exc:
+                    logging.debug(f"Ошибка при OpenCV обработке для pyzbar: {exc}")
         
-        results = []
-        for qr in qr_codes:
-            data = qr.data.decode("utf-8")
-            qr_type = qr.type
-            rect = qr.rect
-            results.append({
-                "data": data,
-                "type": qr_type,
-                "rect": {
-                    "left": rect.left,
-                    "top": rect.top,
-                    "width": rect.width,
-                    "height": rect.height,
-                },
-            })
-            logging.info(f"Найден QR-код типа {qr_type}: {data[:100]}...")
+        # Метод 2: OpenCV QRCodeDetector (более надежный для QR-кодов)
+        # Вызываем ВСЕГДА, даже если pyzbar что-то нашел, так как он может найти правильный QR-код
+        if cv2 is not None:
+            logging.info("Пробуем OpenCV QRCodeDetector...")
+            try:
+                import numpy as np
+                img_array = np.array(image)
+                img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                
+                # Используем QRCodeDetector из OpenCV
+                qr_detector = cv2.QRCodeDetector()
+                
+                # Улучшаем контраст перед обработкой
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+                gray_clahe = clahe.apply(gray)
+                
+                # Увеличиваем изображение для лучшего распознавания (QR-коды должны быть достаточно большими)
+                scale_factor = 3
+                gray_large = cv2.resize(gray, (gray.shape[1] * scale_factor, gray.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
+                gray_clahe_large = cv2.resize(gray_clahe, (gray_clahe.shape[1] * scale_factor, gray_clahe.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
+                
+                # Пробуем несколько вариантов обработки
+                gray_variants = [
+                    ("original", gray),
+                    ("original_large", gray_large),
+                    ("clahe", gray_clahe),
+                    ("clahe_large", gray_clahe_large),
+                    ("adaptive", cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
+                    ("adaptive_large", cv2.adaptiveThreshold(gray_large, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
+                    ("adaptive_inv", cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)),
+                    ("otsu", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                    ("otsu_large", cv2.threshold(gray_large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                    ("otsu_inv", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]),
+                ]
+                
+                for variant_name, processed_gray in gray_variants:
+                    try:
+                        # Пробуем detectAndDecodeMulti (для нескольких QR-кодов)
+                        retval, decoded_info, points, straight_qrcode = qr_detector.detectAndDecodeMulti(processed_gray)
+                        logging.info(f"OpenCV QRCodeDetector ({variant_name}): retval={retval}, decoded_info={decoded_info}")
+                        
+                        if retval and decoded_info:
+                            for i, data in enumerate(decoded_info):
+                                if data and data not in seen_data:
+                                    seen_data.add(data)
+                                    result = {
+                                        "data": data,
+                                        "type": "QRCODE",
+                                        "rect": {
+                                            "left": 0,
+                                            "top": 0,
+                                            "width": processed_gray.shape[1],
+                                            "height": processed_gray.shape[0],
+                                        },
+                                    }
+                                    all_results.append(result)
+                                    logging.info(f"✅ Найден QR-код (OpenCV QRCodeDetector, {variant_name}): {data[:100]}...")
+                                    # Если нашли QR-код с URL, можно остановиться
+                                    if is_url(data):
+                                        logging.info(f"✅ Найден QR-код с URL, останавливаем поиск")
+                                        break
+                        else:
+                            # Если detectAndDecodeMulti не сработал, пробуем detectAndDecode (для одного QR-кода)
+                            # В старых версиях OpenCV может возвращать только 3 значения
+                            try:
+                                result_single = qr_detector.detectAndDecode(processed_gray)
+                                if isinstance(result_single, tuple):
+                                    if len(result_single) >= 2:
+                                        retval_single, decoded_info_single = result_single[0], result_single[1]
+                                    else:
+                                        retval_single, decoded_info_single = False, ""
+                                else:
+                                    # Если вернулась строка напрямую
+                                    retval_single, decoded_info_single = bool(result_single), result_single if result_single else ""
+                                
+                                logging.info(f"OpenCV QRCodeDetector single ({variant_name}): retval={retval_single}, decoded_info={decoded_info_single}")
+                                
+                                if retval_single and decoded_info_single and decoded_info_single not in seen_data:
+                                    seen_data.add(decoded_info_single)
+                                    result = {
+                                        "data": decoded_info_single,
+                                        "type": "QRCODE",
+                                        "rect": {
+                                            "left": 0,
+                                            "top": 0,
+                                            "width": processed_gray.shape[1],
+                                            "height": processed_gray.shape[0],
+                                        },
+                                    }
+                                    all_results.append(result)
+                                    logging.info(f"✅ Найден QR-код (OpenCV QRCodeDetector single, {variant_name}): {decoded_info_single[:100]}...")
+                                    # Если нашли QR-код с URL, можно остановиться
+                                    if is_url(decoded_info_single):
+                                        logging.info(f"✅ Найден QR-код с URL, останавливаем поиск")
+                                        break
+                            except ValueError as ve:
+                                # Если не удалось распаковать, пробуем другой способ
+                                logging.debug(f"Не удалось распаковать результат detectAndDecode: {ve}")
+                                continue
+                        
+                        # Если нашли QR-код с URL, прекращаем перебор вариантов
+                        if any(is_url(r.get("data", "")) for r in all_results):
+                            logging.info(f"✅ Найден QR-код с URL, прекращаем перебор вариантов обработки")
+                            break
+                    except Exception as exc:
+                        logging.warning(f"Ошибка при OpenCV QRCodeDetector ({variant_name}): {exc}", exc_info=True)
+                        continue
+            except Exception as exc:
+                logging.warning(f"Ошибка при использовании OpenCV QRCodeDetector: {exc}")
+        else:
+            logging.info("OpenCV недоступен, пропускаем QRCodeDetector")
         
-        return results
+        # Метод 3: qreader (современная библиотека с YOLO для детекции QR-кодов)
+        if QREADER_AVAILABLE and qreader_instance is not None:
+            logging.info("Пробуем qreader...")
+            try:
+                import numpy as np
+                img_array = np.array(image)
+                
+                # qreader работает с numpy массивами
+                try:
+                    decoded_result = qreader_instance.detect_and_decode(image=img_array)
+                    # qreader может вернуть кортеж или строку
+                    if isinstance(decoded_result, tuple):
+                        decoded_text = decoded_result[0] if decoded_result else None
+                    else:
+                        decoded_text = decoded_result
+                    
+                    if decoded_text and decoded_text not in seen_data:
+                        seen_data.add(decoded_text)
+                        result = {
+                            "data": decoded_text,
+                            "type": "QRCODE",
+                            "rect": {
+                                "left": 0,
+                                "top": 0,
+                                "width": image.width,
+                                "height": image.height,
+                            },
+                        }
+                        all_results.append(result)
+                        logging.info(f"✅ Найден QR-код (qreader): {decoded_text[:100]}...")
+                        # Если нашли QR-код с URL, можно остановиться
+                        if is_url(decoded_text):
+                            logging.info(f"✅ Найден QR-код с URL через qreader, останавливаем поиск")
+                            return all_results
+                except Exception as exc:
+                    logging.debug(f"qreader не смог распознать QR-код: {exc}")
+                
+                # Пробуем также на увеличенном изображении (только если не нашли URL)
+                if not any(is_url(r.get("data", "")) for r in all_results):
+                    try:
+                        image_large = image.resize((image.width * 3, image.height * 3), Image.Resampling.LANCZOS)
+                        img_array_large = np.array(image_large)
+                        decoded_result_large = qreader_instance.detect_and_decode(image=img_array_large)
+                        # qreader может вернуть кортеж или строку
+                        if isinstance(decoded_result_large, tuple):
+                            decoded_text_large = decoded_result_large[0] if decoded_result_large else None
+                        else:
+                            decoded_text_large = decoded_result_large
+                        
+                        if decoded_text_large and decoded_text_large not in seen_data:
+                            seen_data.add(decoded_text_large)
+                            result = {
+                                "data": decoded_text_large,
+                                "type": "QRCODE",
+                                "rect": {
+                                    "left": 0,
+                                    "top": 0,
+                                    "width": image_large.width,
+                                    "height": image_large.height,
+                                },
+                            }
+                            all_results.append(result)
+                            logging.info(f"✅ Найден QR-код (qreader, увеличенное): {decoded_text_large[:100]}...")
+                            # Если нашли QR-код с URL, можно остановиться
+                            if is_url(decoded_text_large):
+                                logging.info(f"✅ Найден QR-код с URL через qreader (увеличенное), останавливаем поиск")
+                                return all_results
+                    except Exception as exc:
+                        logging.debug(f"qreader не смог распознать QR-код на увеличенном изображении: {exc}")
+            except Exception as exc:
+                logging.warning(f"Ошибка при использовании qreader: {exc}")
+        else:
+            logging.info("qreader недоступен, пропускаем")
+        
+        return all_results
     except Exception as exc:
         logging.exception(f"Ошибка при чтении QR-кодов: {exc}")
         return []
 
 
-def is_url(text: str) -> bool:
+def is_url(text: str | tuple) -> bool:
     """Проверяет, является ли текст URL."""
     if not text:
+        return False
+    # Обрабатываем кортежи (qreader может вернуть кортеж)
+    if isinstance(text, tuple):
+        text = text[0] if text else ""
+    if not isinstance(text, str):
         return False
     text = text.strip()
     return text.startswith(("http://", "https://"))
@@ -4268,15 +5055,57 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
 async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
     """
     Получает данные чека по URL из QR-кода.
-    Пытается получить JSON данные или парсить HTML страницу.
+    Пытается получить данные через API endpoint или парсинг HTML.
     """
+    from urllib.parse import urlparse, parse_qs
+    
     try:
         logging.info(f"Попытка получить данные чека по URL: {qr_url}")
+        parsed_url = urlparse(qr_url)
+        query_params = parse_qs(parsed_url.query)
         
-        # Делаем запрос с таймаутом
-        response = requests.get(qr_url, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
+        # Для consumer.oofd.kz сначала пробуем известный API endpoint
+        if "consumer.oofd.kz" in qr_url and all(key in query_params for key in ['i', 'f', 's', 't']):
+            api_url = f"{parsed_url.scheme}://{parsed_url.netloc}/api/tickets/get-by-url"
+            api_params = {
+                't': query_params['t'][0],
+                'i': query_params['i'][0],
+                'f': query_params['f'][0],
+                's': query_params['s'][0],
+            }
+            
+            logging.info(f"Пробуем API endpoint: {api_url}")
+            try:
+                api_response = requests.get(
+                    api_url,
+                    params=api_params,
+                    timeout=10,
+                    verify=False,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": qr_url
+                    }
+                )
+                
+                if api_response.status_code == 200:
+                    try:
+                        api_data = api_response.json()
+                        if api_data:
+                            logging.info(f"✅ Получены данные через API endpoint: {list(api_data.keys()) if isinstance(api_data, dict) else 'list'}")
+                            return api_data
+                    except json.JSONDecodeError:
+                        logging.warning("API вернул не JSON")
+            except Exception as api_exc:
+                logging.debug(f"Ошибка при запросе к API endpoint: {api_exc}")
+        
+        # Если API не сработал, делаем обычный запрос к URL
+        response = requests.get(
+            qr_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            verify=False,
+            allow_redirects=True
+        )
         
         if response.status_code != 200:
             logging.warning(f"Не удалось получить данные: статус {response.status_code}")
@@ -4288,7 +5117,7 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
         if "application/json" in content_type or response.text.strip().startswith("{"):
             try:
                 data = response.json()
-                logging.info(f"Получены JSON данные из QR-кода: {list(data.keys())}")
+                logging.info(f"✅ Получены JSON данные из QR-кода: {list(data.keys())}")
                 return data
             except json.JSONDecodeError:
                 logging.warning("Ответ не является валидным JSON")
@@ -4297,18 +5126,12 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
         if "text/html" in content_type:
             html_content = response.text
             
-            # Ищем JSON в script тегах или data атрибутах
-            # Многие сервисы чеков (например, ofd.kz, ofd.ru) вставляют данные в JavaScript
+            # Ищем JSON в script тегах
             json_patterns = [
                 r'window\.receiptData\s*=\s*({.+?});',
                 r'var\s+receipt\s*=\s*({.+?});',
                 r'const\s+receipt\s*=\s*({.+?});',
                 r'let\s+receipt\s*=\s*({.+?});',
-                r'data-receipt=["\']({.+?})["\']',
-                r'<script[^>]*>.*?({["\']store["\'].+?}).*?</script>',
-                r'data\s*:\s*({.+?})',
-                r'receipt\s*:\s*({.+?})',
-                # Для ofd1.kz и подобных сервисов
                 r'__INITIAL_STATE__\s*=\s*({.+?});',
                 r'window\.__data__\s*=\s*({.+?});',
             ]
@@ -4318,11 +5141,9 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
                 if match:
                     try:
                         json_str = match.group(1)
-                        # Пытаемся найти полный JSON объект (может быть многострочным)
-                        # Ищем закрывающую скобку
+                        # Пытаемся найти полный JSON объект
                         brace_count = json_str.count('{') - json_str.count('}')
                         if brace_count > 0:
-                            # Нужно найти больше закрывающих скобок
                             remaining = html_content[match.end():]
                             for i, char in enumerate(remaining):
                                 if char == '}':
@@ -4334,21 +5155,27 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
                         data = json.loads(json_str)
                         logging.info(f"✅ Найден JSON в HTML: {list(data.keys()) if isinstance(data, dict) else 'list'}")
                         return data
-                    except (json.JSONDecodeError, IndexError) as e:
-                        logging.debug(f"Не удалось распарсить JSON по паттерну {pattern[:50]}: {e}")
+                    except (json.JSONDecodeError, IndexError):
                         continue
             
-            # Если не нашли JSON, пытаемся парсить HTML напрямую
-            # Для ofd1.kz и подобных сервисов
-            if "ofd1.kz" in qr_url or "ofd.kz" in qr_url:
-                logging.info("Пытаемся парсить HTML для ofd1.kz/ofd.kz")
+            # Пробуем парсить HTML напрямую для ofd.kz
+            if "ofd1.kz" in qr_url or "oofd.kz" in qr_url or "ofd.kz" in qr_url:
                 parsed_data = parse_ofd_kz_html(html_content)
                 if parsed_data:
-                    logging.info(f"✅ Успешно распарсили HTML: {list(parsed_data.keys())}")
-                    return parsed_data
+                    items = parsed_data.get("items", [])
+                    total = parsed_data.get("total", 0.0)
+                    store = parsed_data.get("store", "")
+                    
+                    if items and total > 0 and store and store != "Неизвестно":
+                        logging.info(f"✅ Успешно распарсили HTML: {list(parsed_data.keys())}")
+                        return parsed_data
+                    else:
+                        logging.warning(f"⚠️ HTML парсинг вернул пустые данные: store={store}, items={len(items)}, total={total}")
+                
+                logging.warning("HTML парсинг не дал результатов. Это может быть SPA приложение.")
+                return None
             
-            logging.warning("Не удалось найти JSON данные в HTML, требуется парсинг HTML")
-            logging.debug(f"Первые 500 символов HTML: {html_content[:500]}")
+            logging.warning("Не удалось найти JSON данные в HTML")
             return None
         
         logging.warning(f"Неизвестный тип контента: {content_type}")
@@ -4469,7 +5296,23 @@ def build_expense_payload_from_receipt(receipt_record: Dict[str, Any]) -> Dict[s
     expense_hash = calculate_hash(
         f"{receipt_record.get('user_id')}|receipt|{receipt_record.get('receipt_hash')}"
     )
-    return {
+    
+    # Определяем категорию из items чека (берем самую частую категорию)
+    category = None
+    items = receipt_record.get("items", [])
+    if items and isinstance(items, list):
+        category_counts = {}
+        for item in items:
+            if isinstance(item, dict):
+                item_category = item.get("category")
+                if item_category:
+                    category_counts[item_category] = category_counts.get(item_category, 0) + 1
+        
+        if category_counts:
+            # Берем самую частую категорию
+            category = max(category_counts.items(), key=lambda x: x[1])[0]
+    
+    payload = {
         "user_id": receipt_record.get("user_id"),
         "source": "receipt",
         "store": receipt_record.get("store"),
@@ -4481,6 +5324,12 @@ def build_expense_payload_from_receipt(receipt_record: Dict[str, Any]) -> Dict[s
         "status": "pending_review",
         "period": (receipt_record.get("purchased_at") or "")[:7],
     }
+    
+    # Добавляем категорию если определили
+    if category:
+        payload["category"] = category
+    
+    return payload
 
 
 def build_bank_payload(user_id: int, txn: ParsedBankTransaction) -> Dict[str, Any]:
@@ -4524,7 +5373,9 @@ async def reconcile_transactions(
             "status": "pending_review",
             "period": (record.get("booked_at") or "")[:7],
         }
-        await gateway.record_expense(expense_payload)
+        expense_result = await gateway.record_expense(expense_payload)
+        if expense_result.get("duplicate"):
+            logging.info(f"Skipped duplicate expense from bank transaction: {record.get('transaction_hash')}")
 
 
 def calculate_hash(value: str) -> str:
