@@ -123,6 +123,15 @@ class DeleteStates(StatesGroup):
     waiting_for_confirmation = State()
 
 
+class ReportStates(StatesGroup):
+    waiting_for_start_date = State()
+    waiting_for_end_date = State()
+
+
+class DeleteExpenseStates(StatesGroup):
+    waiting_for_confirmation = State()
+
+
 @dataclass
 class ParsedReceiptItem:
     name: str
@@ -189,20 +198,28 @@ class Snapshot:
 RECEIPT_BASE_PROMPT = (
     "Верни только JSON без комментариев со следующей структурой: "
     "{\"store\": str, \"merchant_address\": str | null, "
-    "\"purchased_at\": iso8601 datetime (UTC или локальная зона), \"currency\": ISO4217, "
-    "\"total\": float, \"tax_amount\": float | null, "
-    "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
+        "\"purchased_at\": iso8601 datetime (UTC или локальная зона), \"currency\": ISO4217, "
+        "\"total\": float, \"tax_amount\": float | null, "
+        "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
     "\n\nВАЖНО: "
     "- \"quantity\" - это количество товара (например, 2, 3, 1.5)"
     "- \"price\" - это ОБЩАЯ сумма за позицию (количество × цена за единицу), а не цена за единицу"
     "- Для каждого товара определи категорию на основе его названия. "
-    "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
-    "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
-    "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
-    "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
-    "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
-    "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
-    "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
+    "Используй категории: "
+    "\"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
+    "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Кондитерские изделия\", "
+    "\"Одежда\", \"Обувь\", \"Аксессуары\", \"Бытовая химия\", \"Косметика/Гигиена\", "
+    "\"Электроника\", \"Техника\", \"Компьютеры/Телефоны\", \"Мебель\", \"Дом/Интерьер\", "
+    "\"Ресторан/Кафе\", \"Доставка еды\", \"Фастфуд\", \"Транспорт\", \"Такси\", \"Парковка\", "
+    "\"Бензин/Топливо\", \"Здоровье\", \"Медицина\", \"Аптека\", \"Лекарства\", "
+    "\"Образование\", \"Книги\", \"Канцтовары\", \"Игрушки\", \"Детские товары\", "
+    "\"Развлечения\", \"Кино\", \"Театр\", \"Концерты\", \"Спорт\", \"Фитнес\", "
+    "\"Путешествия\", \"Отель\", \"Авиабилеты\", \"Железнодорожные билеты\", "
+    "\"Коммунальные\", \"Электричество\", \"Вода\", \"Газ\", \"Отопление\", "
+    "\"Интернет/Связь\", \"Мобильная связь\", \"Подписки\", \"Стриминг\", "
+    "\"Страхование\", \"Налоги\", \"Штрафы\", \"Банковские услуги\", "
+    "\"Ремонт\", \"Строительные материалы\", \"Инструменты\", \"Садоводство\", "
+    "\"Животные\", \"Корм для животных\", \"Ветеринария\", \"Другое\". "
     "Если категория не очевидна, используй \"Другое\"."
 )
 
@@ -213,7 +230,7 @@ RECEIPT_EXTRACTION_PROMPT = os.getenv(
 
 RECEIPT_DATA_STRUCTURING_PROMPT = os.getenv(
     "RECEIPT_DATA_PROMPT",
-    f"Ты получаешь данные чека, которые были извлечены с веб-страницы. Структурируй и улучши эти данные, определи категории товаров. {RECEIPT_BASE_PROMPT}",
+    f"Ты получаешь данные чека, которые были извлечены с веб-страницы. Структурируй и улучши эти данные. ОБЯЗАТЕЛЬНО определи категорию для КАЖДОГО товара на основе его названия. Если в данных нет категорий или они null, ты должен их добавить. {RECEIPT_BASE_PROMPT}",
 ).strip()
 RECEIPT_MODEL = os.getenv("RECEIPT_OCR_MODEL", "gpt-4o").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -330,8 +347,8 @@ class ReceiptParserAI:
         else:
             if not mime_type.startswith("image/"):
                 raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-            data_url = build_data_url(file_bytes, mime_type)
-            payload = self._build_payload(data_url)
+        data_url = build_data_url(file_bytes, mime_type)
+        payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -369,13 +386,22 @@ class ReceiptParserAI:
             '"total": float, "tax_amount": float | null, '
             '"items": [{"name": str, "quantity": float, "price": float, "category": str | null}]}. '
             "Улучши категории товаров на основе их названий. "
-            "Используй категории: \"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
-            "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Одежда\", \"Обувь\", "
-            "\"Бытовая химия\", \"Косметика/Гигиена\", \"Электроника\", \"Техника\", \"Мебель\", "
-            "\"Ресторан/Кафе\", \"Доставка еды\", \"Транспорт\", \"Такси\", \"Парковка\", "
-            "\"Здоровье\", \"Медицина\", \"Аптека\", \"Образование\", \"Книги\", "
-            "\"Развлечения\", \"Кино\", \"Спорт\", \"Фитнес\", \"Путешествия\", "
-            "\"Отель\", \"Коммунальные\", \"Интернет/Связь\", \"Подписки\", \"Другое\". "
+            "Используй категории: "
+            "\"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
+            "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Кондитерские изделия\", "
+            "\"Одежда\", \"Обувь\", \"Аксессуары\", \"Бытовая химия\", \"Косметика/Гигиена\", "
+            "\"Электроника\", \"Техника\", \"Компьютеры/Телефоны\", \"Мебель\", \"Дом/Интерьер\", "
+            "\"Ресторан/Кафе\", \"Доставка еды\", \"Фастфуд\", \"Транспорт\", \"Такси\", \"Парковка\", "
+            "\"Бензин/Топливо\", \"Здоровье\", \"Медицина\", \"Аптека\", \"Лекарства\", "
+            "\"Образование\", \"Книги\", \"Канцтовары\", \"Игрушки\", \"Детские товары\", "
+            "\"Развлечения\", \"Кино\", \"Театр\", \"Концерты\", \"Спорт\", \"Фитнес\", "
+            "\"Путешествия\", \"Отель\", \"Авиабилеты\", \"Железнодорожные билеты\", "
+            "\"Коммунальные\", \"Электричество\", \"Вода\", \"Газ\", \"Отопление\", "
+            "\"Интернет/Связь\", \"Мобильная связь\", \"Подписки\", \"Стриминг\", "
+            "\"Страхование\", \"Налоги\", \"Штрафы\", \"Банковские услуги\", "
+            "\"Ремонт\", \"Строительные материалы\", \"Инструменты\", \"Садоводство\", "
+            "\"Животные\", \"Корм для животных\", \"Ветеринария\", \"Другое\". "
+            "Если категория не очевидна, используй \"Другое\". "
             "Исправь названия товаров, если они некорректны. "
             "Сохрани все исходные данные, только улучши их."
         )
@@ -428,7 +454,27 @@ class ReceiptParserAI:
         
         # Если есть данные из QR-кода, отправляем их для структурирования
         if qr_data is not None:
-            user_text = f"Вот данные чека, которые были извлечены с веб-страницы:\n\n{json.dumps(qr_data, ensure_ascii=False, indent=2)}\n\nСтруктурируй эти данные и верни JSON с правильными категориями товаров."
+            user_text = (
+                f"Вот данные чека, которые были извлечены с веб-страницы:\n\n"
+                f"{json.dumps(qr_data, ensure_ascii=False, indent=2)}\n\n"
+                f"ВАЖНО: Структурируй эти данные и ОБЯЗАТЕЛЬНО определи категорию для КАЖДОГО товара на основе его названия. "
+                f"Если в данных категории отсутствуют или равны null, ты должен их добавить. "
+                f"Используй категории из списка: "
+                f"Продукты, Мясо/Рыба, Молочные продукты, Хлеб/Выпечка, "
+                f"Овощи/Фрукты, Напитки, Алкоголь, Сладости, Кондитерские изделия, "
+                f"Одежда, Обувь, Аксессуары, Бытовая химия, Косметика/Гигиена, "
+                f"Электроника, Техника, Компьютеры/Телефоны, Мебель, Дом/Интерьер, "
+                f"Ресторан/Кафе, Доставка еды, Фастфуд, Транспорт, Такси, Парковка, "
+                f"Бензин/Топливо, Здоровье, Медицина, Аптека, Лекарства, "
+                f"Образование, Книги, Канцтовары, Игрушки, Детские товары, "
+                f"Развлечения, Кино, Театр, Концерты, Спорт, Фитнес, "
+                f"Путешествия, Отель, Авиабилеты, Железнодорожные билеты, "
+                f"Коммунальные, Электричество, Вода, Газ, Отопление, "
+                f"Интернет/Связь, Мобильная связь, Подписки, Стриминг, "
+                f"Страхование, Налоги, Штрафы, Банковские услуги, "
+                f"Ремонт, Строительные материалы, Инструменты, Садоводство, "
+                f"Животные, Корм для животных, Ветеринария, Другое."
+            )
             logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
             
             # Используем промпт для структурирования данных
@@ -461,21 +507,21 @@ class ReceiptParserAI:
                         "role": "system",
                         "content": system_prompt,
                     },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
                                 "text": user_text,
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": data_url},
-                            },
-                        ],
-                    },
-                ],
-            }
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                },
+            ],
+        }
         
         # Добавляем prompt_cache_key для лучшего кэширования
         # Используем хеш системного промпта как ключ кэша
@@ -548,12 +594,24 @@ class SupabaseGateway:
         # Проверяем, существует ли чек
         is_duplicate = await self.check_receipt_exists(receipt_hash)
         
+        if is_duplicate:
+            logging.info("Receipt with hash %s already exists, will update if data differs", receipt_hash)
+        
         stored_receipt = await asyncio.to_thread(
             self._table_upsert,
             self.receipts_table,
             payload,
             on_conflict="receipt_hash",
         )
+        
+        # Проверяем, что получили реальную запись из базы (с id)
+        if stored_receipt and stored_receipt.get("id"):
+            if is_duplicate:
+                logging.info("Receipt updated/retrieved: id=%s, hash=%s", stored_receipt.get("id"), receipt_hash)
+            else:
+                logging.info("Receipt created: id=%s, hash=%s", stored_receipt.get("id"), receipt_hash)
+        else:
+            logging.warning("Upsert returned receipt without id, using payload as fallback")
         
         return stored_receipt, is_duplicate
 
@@ -679,12 +737,21 @@ class SupabaseGateway:
             on_conflict="expense_hash",
         )
 
-    async def fetch_monthly_report(self, user_id: int, period: str) -> Dict[str, Any]:
-        logging.info("Fetching report for user=%s period=%s", user_id, period)
+    async def fetch_monthly_report(
+        self, 
+        user_id: int, 
+        period: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> Dict[str, Any]:
+        logging.info("Fetching report for user=%s period=%s start_date=%s end_date=%s", 
+                    user_id, period, start_date, end_date)
         return await asyncio.to_thread(
             self._fetch_report_sync,
             user_id,
             period,
+            start_date,
+            end_date,
         )
 
     async def export_expenses_csv(self, user_id: int, period: Optional[str]) -> str:
@@ -714,8 +781,14 @@ class SupabaseGateway:
                 .execute()
             )
             if result.data and len(result.data) > 0:
-                logging.info(f"✅ Успешно сохранено в {table}: {result.data[0].get('id')}")
-                return result.data[0]
+                record_id = result.data[0].get('id')
+                # Проверяем, что получили реальную запись с id
+                if record_id:
+                    logging.info(f"✅ Успешно сохранено в {table}: id={record_id}")
+                    return result.data[0]
+                else:
+                    logging.warning(f"⚠️ Supabase вернул запись без id для {table}, используем payload")
+                    return payload
             else:
                 logging.warning(f"⚠️ Supabase вернул пустой результат для {table}, используем payload")
                 return payload
@@ -759,21 +832,91 @@ class SupabaseGateway:
         )
         return result.data if result.data else payloads
 
-    def _fetch_report_sync(self, user_id: int, period: str) -> Dict[str, Any]:
-        data = (
+    def _fetch_report_sync(
+        self, 
+        user_id: int, 
+        period: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Получает отчет за период.
+        Если указан period (формат YYYY-MM), используется он.
+        Если указаны start_date и end_date (формат YYYY-MM-DD), используется диапазон дат.
+        Категории берутся из items чеков, а не из категории расхода.
+        """
+        query = (
             self._client.table(self.expenses_table)
-            .select("*")
+            .select("*, receipt_id")
             .eq("user_id", user_id)
-            .ilike("period", period)
-            .execute()
-            .data
-            or []
         )
+        
+        if period:
+            # Фильтр по периоду (месяц)
+            query = query.ilike("period", period)
+        elif start_date and end_date:
+            # Фильтр по диапазону дат
+            query = query.gte("date", start_date).lte("date", end_date)
+        else:
+            # Если ничего не указано, берем текущий месяц
+            period = datetime.utcnow().strftime("%Y-%m")
+            query = query.ilike("period", period)
+        
+        data = query.execute().data or []
         total = sum(entry.get("amount", 0.0) for entry in data)
         
-        # Разбивка по категориям
+        # Получаем все receipt_id из expenses
+        receipt_ids = [entry.get("receipt_id") for entry in data if entry.get("receipt_id")]
+        
+        # Получаем чеки для извлечения категорий из items и поиска самой дорогой покупки
+        receipts_data = {}
+        receipts_full_data = {}
+        if receipt_ids:
+            receipts_query = (
+                self._client.table(self.receipts_table)
+                .select("id, items, store, purchased_at")
+                .in_("id", receipt_ids)
+            )
+            receipts_result = receipts_query.execute().data or []
+            receipts_data = {r.get("id"): r.get("items", []) for r in receipts_result}
+            receipts_full_data = {
+                r.get("id"): {
+                    "items": r.get("items", []),
+                    "store": r.get("store", ""),
+                    "purchased_at": r.get("purchased_at", "")
+                }
+                for r in receipts_result
+            }
+        
+        # Разбивка по категориям товаров из items чеков
         categories = {}
+        expenses_without_receipt = []
+        
         for entry in data:
+            receipt_id = entry.get("receipt_id")
+            if receipt_id and receipt_id in receipts_data:
+                # Берем категории из items чека
+                items = receipts_data[receipt_id]
+                if items and isinstance(items, list) and len(items) > 0:
+                    # Есть items - суммируем по категориям товаров
+                    for item in items:
+                        if isinstance(item, dict):
+                            item_category = item.get("category")
+                            item_price = float(item.get("price", 0.0))
+                            if item_category:
+                                categories[item_category] = categories.get(item_category, 0.0) + item_price
+                            else:
+                                # Если категории нет, используем "Другое"
+                                categories["Другое"] = categories.get("Другое", 0.0) + item_price
+                else:
+                    # Нет items в чеке - используем категорию из expense или "Другое"
+                    expenses_without_receipt.append(entry)
+            else:
+                # Нет чека - используем категорию из expense или "Другое"
+                expenses_without_receipt.append(entry)
+        
+        # Обрабатываем расходы без чеков или без items
+        for entry in expenses_without_receipt:
             category = entry.get("category") or "Другое"
             amount = entry.get("amount", 0.0)
             categories[category] = categories.get(category, 0.0) + amount
@@ -785,7 +928,7 @@ class SupabaseGateway:
             amount = entry.get("amount", 0.0)
             stores[store] = stores.get(store, 0.0) + amount
         
-        # Разбивка по дням
+        # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
         daily = {}
         for entry in data:
             date_str = entry.get("date", "")
@@ -794,13 +937,62 @@ class SupabaseGateway:
                 amount = entry.get("amount", 0.0)
                 daily[day] = daily.get(day, 0.0) + amount
         
+        # Поиск самой дорогой покупки (из items чеков)
+        most_expensive_item = None
+        most_expensive_item_price = 0.0
+        most_expensive_item_store = ""
+        most_expensive_item_date = ""
+        
+        for receipt_id, receipt_info in receipts_full_data.items():
+            items = receipt_info.get("items", [])
+            if items and isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        item_price = float(item.get("price", 0.0))
+                        if item_price > most_expensive_item_price:
+                            most_expensive_item_price = item_price
+                            most_expensive_item = item.get("name", "Неизвестно")
+                            most_expensive_item_store = receipt_info.get("store", "Неизвестно")
+                            most_expensive_item_date = receipt_info.get("purchased_at", "")
+        
+        # Поиск самой дорогой траты (из expenses)
+        most_expensive_expense = None
+        most_expensive_expense_amount = 0.0
+        most_expensive_expense_store = ""
+        most_expensive_expense_date = ""
+        
+        for entry in data:
+            amount = float(entry.get("amount", 0.0))
+            if amount > most_expensive_expense_amount:
+                most_expensive_expense_amount = amount
+                most_expensive_expense_store = entry.get("store", "Неизвестно")
+                most_expensive_expense_date = entry.get("date", "")
+        
+        # Определяем период для отображения
+        display_period = period
+        if start_date and end_date:
+            display_period = f"{start_date} - {end_date}"
+        elif not display_period:
+            display_period = datetime.utcnow().strftime("%Y-%m")
+        
         return {
-            "period": period,
+            "period": display_period,
             "total": total,
             "entries": data,
             "by_category": categories,
             "by_store": stores,
             "by_day": daily,
+            "most_expensive_item": {
+                "name": most_expensive_item,
+                "price": most_expensive_item_price,
+                "store": most_expensive_item_store,
+                "date": most_expensive_item_date
+            } if most_expensive_item else None,
+            "most_expensive_expense": {
+                "amount": most_expensive_expense_amount,
+                "store": most_expensive_expense_store,
+                "date": most_expensive_expense_date
+            } if most_expensive_expense_amount > 0 else None,
         }
 
     def _export_expenses_csv_sync(self, user_id: int, period: Optional[str]) -> str:
@@ -870,6 +1062,130 @@ class SupabaseGateway:
         logging.warning(f"Total deleted records for user={user_id}: {total_deleted}")
         return result
 
+    def _fetch_receipts_list_sync(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Получает список чеков пользователя для отображения"""
+        try:
+            result = (
+                self._client.table(self.receipts_table)
+                .select("id, store, total, currency, purchased_at")
+                .eq("user_id", user_id)
+                .order("purchased_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
+        except Exception as exc:
+            logging.exception(f"Error fetching receipts list for user={user_id}: {exc}")
+            return []
+
+    def _fetch_expenses_list_sync(self, user_id: int, limit: int = 50, months_back: int = 3) -> List[Dict[str, Any]]:
+        """Получает список расходов пользователя для отображения"""
+        try:
+            # Получаем expenses с joined данными из receipts для получения purchased_at с временем
+            query = (
+                self._client.table(self.expenses_table)
+                .select("id, store, amount, currency, date, source, category, receipt_id, receipts(purchased_at)")
+                .eq("user_id", user_id)
+            )
+            
+            # Фильтруем по периоду (последние N месяцев)
+            if months_back > 0:
+                from datetime import datetime, timedelta
+                cutoff_date = (datetime.utcnow() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+                query = query.gte("date", cutoff_date)
+            
+            result = (
+                query
+                .order("date", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
+        except Exception as exc:
+            logging.exception(f"Error fetching expenses list for user={user_id}: {exc}")
+            return []
+
+    def _delete_expense_sync(self, user_id: int, expense_id: int) -> bool:
+        """Удаляет конкретный расход пользователя с каскадным удалением источника"""
+        try:
+            # Сначала получаем expense, чтобы узнать источник
+            expense_result = (
+                self._client.table(self.expenses_table)
+                .select("receipt_id, bank_transaction_id, source")
+                .eq("id", expense_id)
+                .eq("user_id", user_id)
+                .execute()
+            )
+            
+            if not expense_result.data or len(expense_result.data) == 0:
+                logging.warning(f"Expense id={expense_id} not found or not owned by user={user_id}")
+                return False
+            
+            expense = expense_result.data[0]
+            receipt_id = expense.get("receipt_id")
+            bank_transaction_id = expense.get("bank_transaction_id")
+            source = expense.get("source", "")
+            
+            # Удаляем источник (receipt или bank_transaction) перед удалением expense
+            if receipt_id:
+                try:
+                    receipt_result = (
+                        self._client.table(self.receipts_table)
+                        .delete()
+                        .eq("id", receipt_id)
+                        .eq("user_id", user_id)
+                        .execute()
+                    )
+                    if receipt_result.data:
+                        logging.info(f"Deleted receipt id={receipt_id} (cascade from expense {expense_id})")
+                except Exception as exc:
+                    logging.exception(f"Error deleting receipt id={receipt_id} (cascade): {exc}")
+            
+            if bank_transaction_id:
+                try:
+                    bank_result = (
+                        self._client.table(self.bank_table)
+                        .delete()
+                        .eq("id", bank_transaction_id)
+                        .eq("user_id", user_id)
+                        .execute()
+                    )
+                    if bank_result.data:
+                        logging.info(f"Deleted bank_transaction id={bank_transaction_id} (cascade from expense {expense_id})")
+                except Exception as exc:
+                    logging.exception(f"Error deleting bank_transaction id={bank_transaction_id} (cascade): {exc}")
+            
+            # Теперь удаляем сам expense
+            result = (
+                self._client.table(self.expenses_table)
+                .delete()
+                .eq("id", expense_id)
+                .eq("user_id", user_id)  # Проверка безопасности: только свои расходы
+                .execute()
+            )
+            deleted = len(result.data) if result.data else 0
+            if deleted > 0:
+                logging.info(f"Deleted expense id={expense_id} for user={user_id} (source={source})")
+                return True
+            else:
+                logging.warning(f"Expense id={expense_id} not found or not owned by user={user_id}")
+                return False
+        except Exception as exc:
+            logging.exception(f"Error deleting expense id={expense_id} for user={user_id}: {exc}")
+            return False
+
+    async def fetch_receipts_list(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Асинхронная обертка для получения списка чеков"""
+        return await asyncio.to_thread(self._fetch_receipts_list_sync, user_id, limit)
+
+    async def fetch_expenses_list(self, user_id: int, limit: int = 50, months_back: int = 3) -> List[Dict[str, Any]]:
+        """Асинхронная обертка для получения списка расходов"""
+        return await asyncio.to_thread(self._fetch_expenses_list_sync, user_id, limit, months_back)
+
+    async def delete_expense(self, user_id: int, expense_id: int) -> bool:
+        """Асинхронная обертка для удаления расхода"""
+        return await asyncio.to_thread(self._delete_expense_sync, user_id, expense_id)
+
 
 def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
     """
@@ -926,7 +1242,7 @@ class LedgerFoxBot:
             BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="report", description="Получить отчёт"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
-            BotCommand(command="qr", description="Найти QR-коды на фото"),
+            BotCommand(command="delete_expense", description="Удалить трату"),
             BotCommand(command="delete_all", description="Удалить все данные"),
             BotCommand(command="cancel", description="Отменить операцию"),
         ]
@@ -1077,15 +1393,140 @@ class LedgerFoxBot:
                     "Отчёты по расходам появятся после подключения базы (Supabase)."
                 )
                 return
-            period = datetime.utcnow().strftime("%Y-%m")
-            report = await self.supabase.fetch_monthly_report(message.from_user.id, period)
+            
+            # Показываем меню выбора периода
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📅 Текущий месяц", callback_data="report_current_month"),
+                    InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="report_last_month"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущая неделя", callback_data="report_current_week"),
+                    InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="report_last_week"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущий год", callback_data="report_current_year"),
+                    InlineKeyboardButton(text="📅 Произвольный период", callback_data="report_custom"),
+                ],
+            ])
+            await message.answer(
+                "📊 Выберите период для отчета:",
+                reply_markup=keyboard
+            )
+        
+        @self.router.callback_query(F.data.startswith("report_"))
+        async def handle_report_period(callback: CallbackQuery, state: FSMContext) -> None:
+            await callback.answer()
+            
+            if not self.supabase:
+                await callback.message.answer("Отчёты по расходам появятся после подключения базы (Supabase).")
+            return
+            
+            now = datetime.utcnow()
+            period = None
+            start_date = None
+            end_date = None
+            
+            if callback.data == "report_current_month":
+                period = now.strftime("%Y-%m")
+            elif callback.data == "report_last_month":
+                # Прошлый месяц
+                last_month = (now.replace(day=1) - timedelta(days=1))
+                period = last_month.strftime("%Y-%m")
+            elif callback.data == "report_current_week":
+                # Текущая неделя (понедельник - воскресенье)
+                days_since_monday = now.weekday()
+                start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+            elif callback.data == "report_last_week":
+                # Прошлая неделя
+                days_since_monday = now.weekday()
+                week_start = now - timedelta(days=days_since_monday + 7)
+                week_end = now - timedelta(days=days_since_monday + 1)
+                start_date = week_start.strftime("%Y-%m-%d")
+                end_date = week_end.strftime("%Y-%m-%d")
+            elif callback.data == "report_current_year":
+                # Текущий год
+                start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+            elif callback.data == "report_custom":
+                # Произвольный период - запрашиваем даты
+                await callback.message.answer(
+                    "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+                await state.set_state(ReportStates.waiting_for_start_date)
+                return
+            
+            # Получаем отчет
+            report = await self.supabase.fetch_monthly_report(
+                callback.from_user.id, 
+                period=period,
+                start_date=start_date,
+                end_date=end_date
+            )
             
             # Форматируем отчет с разбивкой
             report_text = format_report(report)
             
             # Обрезаем если слишком длинный
             truncated_report = truncate_message_for_telegram(report_text)
-            await message.answer(truncated_report)
+            await callback.message.answer(truncated_report)
+        
+        @self.router.message(ReportStates.waiting_for_start_date)
+        async def handle_report_start_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты начала периода"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                start_date = date_obj.strftime("%Y-%m-%d")
+                await state.update_data(start_date=start_date)
+                await message.answer(
+                    "📅 Введите дату окончания периода в формате ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
+                await state.set_state(ReportStates.waiting_for_end_date)
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+        
+        @self.router.message(ReportStates.waiting_for_end_date)
+        async def handle_report_end_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты окончания периода"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                end_date = date_obj.strftime("%Y-%m-%d")
+                data = await state.get_data()
+                start_date = data.get("start_date")
+                
+                if not start_date:
+                    await message.answer("❌ Ошибка: не найдена дата начала. Начните заново с /report")
+                    await state.clear()
+                    return
+
+                # Проверяем, что дата окончания не раньше даты начала
+                if end_date < start_date:
+                    await message.answer("❌ Дата окончания не может быть раньше даты начала. Введите корректную дату:")
+                    return
+
+                # Получаем отчет
+                report = await self.supabase.fetch_monthly_report(
+                    message.from_user.id,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                # Форматируем отчет с разбивкой
+                report_text = format_report(report)
+                
+                # Обрезаем если слишком длинный
+                truncated_report = truncate_message_for_telegram(report_text)
+                await message.answer(truncated_report)
+                await state.clear()
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
 
         @self.router.message(Command("delete_all"))
         async def handle_delete_all(message: Message, state: FSMContext) -> None:
@@ -1123,6 +1564,136 @@ class LedgerFoxBot:
                 "Вы уверены?",
                 reply_markup=keyboard
             )
+
+        @self.router.message(Command("delete_expense"))
+        async def handle_delete_expense(message: Message, state: FSMContext) -> None:
+            """Обработчик команды удаления расхода"""
+            logging.info(f"Command /delete_expense received from user {message.from_user.id if message.from_user else 'unknown'}")
+            try:
+                if not self.supabase or not message.from_user:
+                    await message.answer("❌ Удаление трат доступно только при подключенной базе данных.")
+                    return
+                
+                await state.clear()
+                
+                # Получаем список расходов (последние 3 месяца, максимум 20 записей)
+                logging.info(f"Fetching expenses list for user {message.from_user.id}")
+                expenses = await self.supabase.fetch_expenses_list(message.from_user.id, limit=20, months_back=3)
+                logging.info(f"Found {len(expenses) if expenses else 0} expenses")
+                
+                if not expenses:
+                    await message.answer("📭 У вас нет сохраненных трат за последние 3 месяца.")
+                    return
+                
+                # Формируем сообщение со списком трат
+                text_lines = [f"🗑️ Выберите трату для удаления:\n(показаны последние 3 месяца, {len(expenses)} записей)\n"]
+                keyboard_buttons = []
+                
+                for expense in expenses:  # Показываем все полученные записи
+                    expense_id = expense.get("id")
+                    store = expense.get("store", "Неизвестное место")
+                    amount = expense.get("amount", 0)
+                    currency = expense.get("currency", "")
+                    date = expense.get("date", "")
+                    source = expense.get("source", "")
+                    category = expense.get("category", "")
+                    
+                    # Пытаемся получить время из связанного чека (receipts)
+                    purchased_at = None
+                    receipts_data = expense.get("receipts")
+                    if receipts_data and isinstance(receipts_data, list) and len(receipts_data) > 0:
+                        purchased_at = receipts_data[0].get("purchased_at")
+                    elif receipts_data and isinstance(receipts_data, dict):
+                        purchased_at = receipts_data.get("purchased_at")
+                    
+                    # Форматируем полную дату и время
+                    try:
+                        if purchased_at:
+                            # Используем время из чека
+                            if isinstance(purchased_at, str):
+                                date_obj = datetime.fromisoformat(purchased_at.replace('Z', '+00:00'))
+                            else:
+                                date_obj = purchased_at
+                            date_str = date_obj.strftime("%d.%m.%Y %H:%M")
+                        elif isinstance(date, str):
+                            # Если дата в формате YYYY-MM-DD, добавляем время 00:00
+                            if len(date) == 10:
+                                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                            else:
+                                date_obj = datetime.fromisoformat(date.replace('Z', '+00:00'))
+                            date_str = date_obj.strftime("%d.%m.%Y %H:%M")
+                        else:
+                            date_obj = date
+                            date_str = date_obj.strftime("%d.%m.%Y %H:%M")
+                    except Exception as e:
+                        logging.warning(f"Ошибка форматирования даты для expense {expense_id}: {e}")
+                        date_str = str(date)[:10] + " 00:00"
+                    
+                    # Преобразуем код валюты в символ
+                    currency_symbols = {
+                        "RUB": "₽",
+                        "KZT": "₸",
+                        "USD": "$",
+                        "EUR": "€",
+                        "GBP": "£",
+                        "CNY": "¥",
+                        "JPY": "¥",
+                    }
+                    currency_symbol = currency_symbols.get(currency.upper(), currency.upper()[:3])
+                    
+                    # Очищаем название магазина от префиксов (ТОО, ЗАО, Магазин, АЗС, Кафе и т.д.)
+                    store_clean = store
+                    if store_clean:
+                        # Убираем кавычки в начале и конце
+                        store_clean = store_clean.strip('"\'«»')
+                        # Убираем префиксы организационно-правовых форм и типов заведений
+                        prefixes_to_remove = [
+                            r'^ТОО\s+["«]?',
+                            r'^ЗАО\s+["«]?',
+                            r'^ОАО\s+["«]?',
+                            r'^ПАО\s+["«]?',
+                            r'^ООО\s+["«]?',
+                            r'^ИП\s+',
+                            r'^АО\s+["«]?',
+                            r'^ПК\s+["«]?',
+                            r'^ПТ\s+["«]?',
+                            r'^КТ\s+["«]?',
+                            r'^ОДО\s+["«]?',
+                            r'^МАГАЗИН\s+["«]?',
+                            r'^АЗС\s+["«]?',
+                            r'^КАФЕ\s+["«]?',
+                            r'^РЕСТОРАН\s+["«]?',
+                            r'^СУПЕРМАРКЕТ\s+["«]?',
+                            r'^ГИПЕРМАРКЕТ\s+["«]?',
+                            r'^ТОРГОВЫЙ\s+ЦЕНТР\s+["«]?',
+                            r'^ТЦ\s+["«]?',
+                            r'^ТОРГОВЫЙ\s+ДОМ\s+["«]?',
+                            r'^ТД\s+["«]?',
+                        ]
+                        for pattern in prefixes_to_remove:
+                            store_clean = re.sub(pattern, '', store_clean, flags=re.IGNORECASE)
+                        # Убираем кавычки в конце после удаления префикса
+                        store_clean = store_clean.strip('"\'«»').strip()
+                    
+                    # Формируем компактный текст кнопки
+                    # Формат: магазин сумма символ_валюты дата_время
+                    store_short = store_clean[:10] if store_clean else (store[:10] if store else "Без названия")
+                    # Убираем категорию и иконку из кнопки для экономии места
+                    button_text = f"{store_short} {amount:.0f}{currency_symbol} {date_str}"
+                    
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            text=button_text,
+                            callback_data=f"delete_expense_{expense_id}"
+                        )
+                    ])
+                
+                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                await message.answer(text_lines[0], reply_markup=keyboard)
+                logging.info(f"Sent expenses list with {len(keyboard_buttons)} buttons")
+            except Exception as exc:
+                logging.exception(f"Error in handle_delete_expense: {exc}")
+                await message.answer(f"❌ Ошибка при получении списка трат: {str(exc)[:200]}")
 
         @self.router.message(Command("expense"))
         async def handle_expense_entry(message: Message, state: FSMContext) -> None:
@@ -1177,6 +1748,13 @@ class LedgerFoxBot:
             try:
                 # Сохраняем чек в базу
                 stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
+                
+                # Проверяем, что получили реальную запись с id
+                if not stored_receipt or not stored_receipt.get("id"):
+                    await callback.message.answer("⚠️ Ошибка: не удалось сохранить чек в базу данных")
+                    await state.clear()
+                    return
+                
                 if is_duplicate:
                     await callback.message.answer("⚠️ Этот чек уже был сохранен ранее (дубликат)")
                 else:
@@ -1245,6 +1823,121 @@ class LedgerFoxBot:
             """Обработчик отмены удаления данных"""
             await callback.answer()
             await callback.message.answer("Удаление отменено. Ваши данные сохранены.")
+            await state.clear()
+
+        @self.router.callback_query(F.data.startswith("delete_expense_"))
+        async def handle_delete_expense_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик подтверждения удаления расхода"""
+            await callback.answer()
+            
+            if not self.supabase or not callback.from_user:
+                await callback.message.answer("❌ Ошибка: база данных не подключена.")
+                return
+            
+            # Извлекаем ID траты из callback_data
+            expense_id_str = callback.data.replace("delete_expense_", "")
+            try:
+                expense_id = int(expense_id_str)
+            except ValueError:
+                await callback.message.answer("❌ Ошибка: неверный ID траты.")
+                return
+            
+            # Получаем информацию о трате для подтверждения (без ограничения по периоду для поиска)
+            expenses = await self.supabase.fetch_expenses_list(callback.from_user.id, limit=1000, months_back=0)
+            expense = next((e for e in expenses if e.get("id") == expense_id), None)
+            
+            if not expense:
+                await callback.message.answer("❌ Трата не найдена.")
+                await state.clear()
+                return
+            
+            store = expense.get("store", "Неизвестное место")
+            amount = expense.get("amount", 0)
+            currency = expense.get("currency", "")
+            date = expense.get("date", "")
+            source = expense.get("source", "")
+            category = expense.get("category", "")
+            
+            # Сохраняем ID и source в state для подтверждения
+            await state.update_data(expense_id=expense_id, user_id=callback.from_user.id, source=source)
+            await state.set_state(DeleteExpenseStates.waiting_for_confirmation)
+            
+            try:
+                if isinstance(date, str):
+                    date_obj = datetime.strptime(date, "%Y-%m-%d")
+                else:
+                    date_obj = date
+                date_str = date_obj.strftime("%d.%m.%Y")
+            except:
+                date_str = str(date)[:10]
+            
+            source_names = {"receipt": "Чек", "bank": "Банк", "manual": "Вручную"}
+            source_name = source_names.get(source, source)
+            source_icon = {"receipt": "🧾", "bank": "🏦", "manual": "✍️"}.get(source, "💰")
+            
+            # Кнопки подтверждения
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delete_expense"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete_expense")
+                ]
+            ])
+            
+            category_text = f"\n📂 Категория: {category}" if category else ""
+            await callback.message.answer(
+                f"⚠️ Вы уверены, что хотите удалить трату?\n\n"
+                f"{source_icon} Источник: {source_name}\n"
+                f"🏪 Место: {store}\n"
+                f"💰 Сумма: {amount:.2f} {currency}\n"
+                f"📅 Дата: {date_str}{category_text}",
+                reply_markup=keyboard
+            )
+
+        @self.router.callback_query(F.data == "confirm_delete_expense")
+        async def handle_confirm_delete_expense(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик финального подтверждения удаления расхода"""
+            await callback.answer()
+            
+            if not self.supabase or not callback.from_user:
+                await callback.message.answer("❌ Ошибка: база данных не подключена.")
+                await state.clear()
+                return
+            
+            data = await state.get_data()
+            expense_id = data.get("expense_id")
+            user_id = data.get("user_id")
+            
+            if not expense_id or user_id != callback.from_user.id:
+                await callback.message.answer("❌ Ошибка: несоответствие данных.")
+                await state.clear()
+                return
+            
+            try:
+                # Получаем source из state для сообщения
+                source = data.get("source", "")
+                success = await self.supabase.delete_expense(user_id, expense_id)
+                if success:
+                    # Формируем сообщение о каскадном удалении
+                    source_text = ""
+                    if source == "receipt":
+                        source_text = "\n🧾 Чек также удален."
+                    elif source == "bank":
+                        source_text = "\n🏦 Банковская транзакция также удалена."
+                    
+                    await callback.message.answer(f"✅ Трата успешно удалена.{source_text}")
+                else:
+                    await callback.message.answer("❌ Не удалось удалить трату. Возможно, она уже была удалена.")
+            except Exception as exc:
+                logging.exception(f"Ошибка при удалении траты: {exc}")
+                await callback.message.answer(f"⚠️ Ошибка при удалении: {str(exc)[:200]}")
+            finally:
+                await state.clear()
+
+        @self.router.callback_query(F.data == "cancel_delete_expense")
+        async def handle_cancel_delete_expense(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик отмены удаления траты"""
+            await callback.answer()
+            await callback.message.answer("❌ Удаление траты отменено.")
             await state.clear()
 
     async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
@@ -1432,6 +2125,21 @@ class LedgerFoxBot:
                 
                 # Преобразуем в ParsedReceipt для форматирования
                 parsed_receipt = build_parsed_receipt(content_json)
+                
+                # Логируем категории из OpenAI ответа
+                items_from_ai = content_json.get("items", [])
+                categories_from_ai = {}
+                items_with_cat = 0
+                items_without_cat = 0
+                for item in items_from_ai:
+                    if isinstance(item, dict):
+                        cat = item.get("category")
+                        if cat:
+                            categories_from_ai[cat] = categories_from_ai.get(cat, 0) + 1
+                            items_with_cat += 1
+                        else:
+                            items_without_cat += 1
+                logging.info(f"Категории из OpenAI ответа: всего items={len(items_from_ai)}, с категорией={items_with_cat}, без категории={items_without_cat}, категории={categories_from_ai}")
                 
                 # Проверяем правильность распознавания: сумма позиций должна совпадать с тоталом
                 items_sum = sum(item.price for item in parsed_receipt.items)
@@ -2048,9 +2756,84 @@ def format_report(report: Dict[str, Any]) -> str:
     by_store = report.get("by_store", {})
     by_day = report.get("by_day", {})
     
-    lines = [f"📊 Отчёт за {period}"]
+    # Форматируем период для отображения
+    display_period = period
+    if " - " in period:
+        # Произвольный период (YYYY-MM-DD - YYYY-MM-DD)
+        try:
+            start_str, end_str = period.split(" - ")
+            start_date = datetime.strptime(start_str, "%Y-%m-%d")
+            end_date = datetime.strptime(end_str, "%Y-%m-%d")
+            display_period = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+        except:
+            pass
+    elif len(period) == 7 and period[4] == "-":
+        # Месяц (YYYY-MM)
+        try:
+            date_obj = datetime.strptime(period, "%Y-%m")
+            # Получаем название месяца на русском
+            months = ["январь", "февраль", "март", "апрель", "май", "июнь",
+                     "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+            month_name = months[date_obj.month - 1]
+            display_period = f"{month_name} {date_obj.year}"
+        except:
+            pass
+    
+    lines = [f"📊 Отчёт за {display_period}"]
     lines.append(f"💰 Всего расходов: {total:.2f}")
     lines.append("")
+    
+    # Самая дорогая покупка и трата
+    most_expensive_item = report.get("most_expensive_item")
+    most_expensive_expense = report.get("most_expensive_expense")
+    
+    if most_expensive_item and most_expensive_item.get("name"):
+        item_name = most_expensive_item.get("name", "Неизвестно")
+        item_price = most_expensive_item.get("price", 0.0)
+        item_store = most_expensive_item.get("store", "Неизвестно")
+        item_date = most_expensive_item.get("date", "")
+        
+        # Форматируем дату
+        date_str = ""
+        if item_date:
+            try:
+                if "T" in item_date:
+                    date_obj = datetime.fromisoformat(item_date.replace("Z", "+00:00"))
+                else:
+                    date_obj = datetime.strptime(item_date[:10], "%Y-%m-%d")
+                date_str = date_obj.strftime("%d.%m.%Y")
+            except:
+                date_str = item_date[:10] if len(item_date) >= 10 else item_date
+        
+        store_name = item_store[:30] if len(item_store) > 30 else item_store
+        lines.append("💎 Самая дорогая покупка:")
+        if date_str:
+            lines.append(f"  {item_name} - {item_price:.2f} ({store_name}, {date_str})")
+        else:
+            lines.append(f"  {item_name} - {item_price:.2f} ({store_name})")
+        lines.append("")
+    
+    if most_expensive_expense and most_expensive_expense.get("amount", 0) > 0:
+        exp_amount = most_expensive_expense.get("amount", 0.0)
+        exp_store = most_expensive_expense.get("store", "Неизвестно")
+        exp_date = most_expensive_expense.get("date", "")
+        
+        # Форматируем дату
+        date_str = ""
+        if exp_date:
+            try:
+                date_obj = datetime.strptime(exp_date[:10], "%Y-%m-%d")
+                date_str = date_obj.strftime("%d.%m.%Y")
+            except:
+                date_str = exp_date[:10] if len(exp_date) >= 10 else exp_date
+        
+        store_name = exp_store[:30] if len(exp_store) > 30 else exp_store
+        lines.append("💸 Самая дорогая трата:")
+        if date_str:
+            lines.append(f"  {exp_amount:.2f} - {store_name} ({date_str})")
+        else:
+            lines.append(f"  {exp_amount:.2f} - {store_name}")
+        lines.append("")
     
     # Разбивка по категориям
     if by_category:
@@ -2067,30 +2850,11 @@ def format_report(report: Dict[str, Any]) -> str:
         sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
         for store, amount in sorted_stores[:5]:  # Топ 5
             percentage = (amount / total * 100) if total > 0 else 0
-            store_name = store[:40] if len(store) > 40 else store
+            # Нормализуем название магазина для отображения (на случай старых данных)
+            store_name = normalize_store_name(store)
+            store_name = store_name[:40] if len(store_name) > 40 else store_name
             lines.append(f"  • {store_name}: {amount:.2f} ({percentage:.1f}%)")
         lines.append("")
-    
-    # График расходов по дням
-    if by_day:
-        lines.append("📈 Расходы по дням:")
-        sorted_days = sorted(by_day.items())
-        if sorted_days:
-            max_amount = max(by_day.values())
-            max_bar_length = 30
-            
-            for day, amount in sorted_days:
-                # Форматируем дату
-                try:
-                    date_obj = datetime.strptime(day, "%Y-%m-%d")
-                    day_str = date_obj.strftime("%d.%m")
-                except:
-                    day_str = day
-                
-                # Создаем текстовый график
-                bar_length = int((amount / max_amount * max_bar_length)) if max_amount > 0 else 0
-                bar = "█" * bar_length
-                lines.append(f"  {day_str}: {bar} {amount:.2f}")
     
     return "\n".join(lines)
 
@@ -4938,7 +5702,9 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
         
         # Извлекаем основные данные
         store_elem = soup.select_one('.ticket_header span, .ticket_header div span')
-        store = store_elem.get_text(strip=True) if store_elem else "Неизвестно"
+        store_raw = store_elem.get_text(strip=True) if store_elem else "Неизвестно"
+        # Нормализуем название магазина сразу при парсинге
+        store = normalize_store_name(store_raw) if store_raw != "Неизвестно" else store_raw
         
         # Дата и время
         date_elem = soup.select_one('.ticket_date_time')
@@ -5091,6 +5857,9 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
                     try:
                         api_data = api_response.json()
                         if api_data:
+                            # Нормализуем название магазина из API данных
+                            if isinstance(api_data, dict) and "store" in api_data:
+                                api_data["store"] = normalize_store_name(api_data["store"])
                             logging.info(f"✅ Получены данные через API endpoint: {list(api_data.keys()) if isinstance(api_data, dict) else 'list'}")
                             return api_data
                     except json.JSONDecodeError:
@@ -5117,6 +5886,9 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
         if "application/json" in content_type or response.text.strip().startswith("{"):
             try:
                 data = response.json()
+                # Нормализуем название магазина из JSON данных
+                if isinstance(data, dict) and "store" in data:
+                    data["store"] = normalize_store_name(data["store"])
                 logging.info(f"✅ Получены JSON данные из QR-кода: {list(data.keys())}")
                 return data
             except json.JSONDecodeError:
@@ -5153,6 +5925,9 @@ async def fetch_receipt_from_qr_url(qr_url: str) -> Optional[Dict[str, Any]]:
                                         break
                         
                         data = json.loads(json_str)
+                        # Нормализуем название магазина из JSON в HTML
+                        if isinstance(data, dict) and "store" in data:
+                            data["store"] = normalize_store_name(data["store"])
                         logging.info(f"✅ Найден JSON в HTML: {list(data.keys()) if isinstance(data, dict) else 'list'}")
                         return data
                     except (json.JSONDecodeError, IndexError):
@@ -5273,14 +6048,94 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def normalize_store_name(store_name: str) -> str:
+    """
+    Нормализует название магазина, сокращая длинные юридические формы и убирая лишние префиксы.
+    Например: 
+    - "ТОВАРИЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "АЛМАСТОР"" -> "ТОО "АЛМАСТОР""
+    - "Филиал №81 ТОВАРИЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "АЛМАСТОР"" -> "ТОО "АЛМАСТОР""
+    """
+    if not store_name:
+        return store_name
+    
+    normalized = store_name
+    
+    # Убираем префиксы типа "Филиал №81", "Магазин №", "Точка продаж" и т.д.
+    prefix_patterns = [
+        r'^ФИЛИАЛ\s+№?\s*\d+\s+',
+        r'^ФИЛИАЛ\s+№?\s*\d+\.\s*',
+        r'^МАГАЗИН\s+№?\s*\d+\s+',
+        r'^ТОЧКА\s+ПРОДАЖ\s+№?\s*\d+\s+',
+        r'^ТП\s+№?\s*\d+\s+',
+        r'^ОТДЕЛ\s+№?\s*\d+\s+',
+        r'^ПОДРАЗДЕЛЕНИЕ\s+№?\s*\d+\s+',
+    ]
+    for pattern in prefix_patterns:
+        normalized = re.sub(pattern, '', normalized, flags=re.IGNORECASE)
+    
+    # Обрабатываем обрезанные названия типа "Товарищество с ограниченной о"
+    # Заменяем на полную форму для последующей нормализации
+    if re.search(r'\bТОВАРИЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+[ОО]\s*$', normalized, re.IGNORECASE):
+        normalized = re.sub(r'\bТОВАРИЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+[ОО]\s*$', 
+                           'ТОВАРИЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ', 
+                           normalized, flags=re.IGNORECASE)
+    
+    # Словарь замен для организационно-правовых форм (регистронезависимо)
+    replacements = {
+        r'\bТОВАРИЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ\b': 'ТОО',
+        r'\bТОО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ\b': 'ТОО',
+        r'\bЗАКРЫТОЕ\s+АКЦИОНЕРНОЕ\s+ОБЩЕСТВО\b': 'ЗАО',
+        r'\bОТКРЫТОЕ\s+АКЦИОНЕРНОЕ\s+ОБЩЕСТВО\b': 'ОАО',
+        r'\bПУБЛИЧНОЕ\s+АКЦИОНЕРНОЕ\s+ОБЩЕСТВО\b': 'ПАО',
+        r'\bОБЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ\b': 'ООО',
+        r'\bИНДИВИДУАЛЬНЫЙ\s+ПРЕДПРИНИМАТЕЛЬ\b': 'ИП',
+        r'\bИНДИВИДУАЛЬНЫЙ\s+ПРЕДПРИНИМАТЕЛЬ\s+ИП\b': 'ИП',
+        r'\bАКЦИОНЕРНОЕ\s+ОБЩЕСТВО\b': 'АО',
+        r'\bПРОИЗВОДСТВЕННЫЙ\s+КООПЕРАТИВ\b': 'ПК',
+        r'\bПОТРЕБИТЕЛЬСКИЙ\s+КООПЕРАТИВ\b': 'ПК',
+        r'\bПОЛНОЕ\s+ТОВАРИЩЕСТВО\b': 'ПТ',
+        r'\bКОММАНДИТНОЕ\s+ТОВАРИЩЕСТВО\b': 'КТ',
+        r'\bОБЩЕСТВО\s+С\s+ДОПОЛНИТЕЛЬНОЙ\s+ОТВЕТСТВЕННОСТЬЮ\b': 'ОДО',
+    }
+    
+    for pattern, replacement in replacements.items():
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    
+    # Убираем лишние пробелы и обрезаем слишком длинные названия
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    # Если название все еще слишком длинное (более 50 символов), обрезаем
+    if len(normalized) > 50:
+        # Пытаемся найти кавычки с названием компании
+        quoted_match = re.search(r'["""]([^"""]+)["""]', normalized)
+        if quoted_match:
+            company_name = quoted_match.group(1)
+            # Берем аббревиатуру + название в кавычках
+            abbrev_match = re.search(r'^([А-Я]{2,4})\s*', normalized)
+            if abbrev_match:
+                abbrev = abbrev_match.group(1)
+                normalized = f'{abbrev} "{company_name}"'
+            else:
+                normalized = f'"{company_name}"'
+        else:
+            # Просто обрезаем до 50 символов
+            normalized = normalized[:47] + "..."
+    
+    return normalized
+
+
 def build_receipt_payload(user_id: int, parsed: ParsedReceipt) -> Dict[str, Any]:
     # Формируем хеш из user_id, даты/времени оплаты и суммы
     receipt_hash = calculate_hash(
         f"{user_id}|{parsed.purchased_at.isoformat()}|{parsed.total}"
     )
+    
+    # Нормализуем название магазина
+    normalized_store = normalize_store_name(parsed.store)
+    
     return {
         "user_id": user_id,
-        "store": parsed.store,
+        "store": normalized_store,
         "total": parsed.total,
         "currency": parsed.currency,
         "purchased_at": parsed.purchased_at.isoformat(),
@@ -5302,20 +6157,36 @@ def build_expense_payload_from_receipt(receipt_record: Dict[str, Any]) -> Dict[s
     items = receipt_record.get("items", [])
     if items and isinstance(items, list):
         category_counts = {}
+        items_with_category = 0
+        items_without_category = 0
         for item in items:
             if isinstance(item, dict):
                 item_category = item.get("category")
                 if item_category:
                     category_counts[item_category] = category_counts.get(item_category, 0) + 1
+                    items_with_category += 1
+                else:
+                    items_without_category += 1
+        
+        logging.info(f"Извлечение категории из чека: всего items={len(items)}, с категорией={items_with_category}, без категории={items_without_category}, категории={category_counts}")
         
         if category_counts:
             # Берем самую частую категорию
             category = max(category_counts.items(), key=lambda x: x[1])[0]
+            logging.info(f"✅ Определена категория расхода: {category} (встречается {category_counts[category]} раз(а))")
+        else:
+            logging.warning(f"⚠️ Не найдено ни одной категории в items чека (store={receipt_record.get('store')}, items={len(items)})")
+    else:
+        logging.warning(f"⚠️ Нет items в чеке для определения категории (store={receipt_record.get('store')})")
+    
+    # Нормализуем название магазина
+    store_name = receipt_record.get("store", "")
+    normalized_store = normalize_store_name(store_name) if store_name else ""
     
     payload = {
         "user_id": receipt_record.get("user_id"),
         "source": "receipt",
-        "store": receipt_record.get("store"),
+        "store": normalized_store,
         "amount": receipt_record.get("total"),
         "currency": receipt_record.get("currency"),
         "date": receipt_record.get("purchased_at"),
@@ -5328,6 +6199,8 @@ def build_expense_payload_from_receipt(receipt_record: Dict[str, Any]) -> Dict[s
     # Добавляем категорию если определили
     if category:
         payload["category"] = category
+    else:
+        logging.warning(f"⚠️ Расход будет сохранен без категории (store={receipt_record.get('store')}, amount={receipt_record.get('total')})")
     
     return payload
 
