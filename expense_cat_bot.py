@@ -870,7 +870,14 @@ class SupabaseGateway:
             query = query.ilike("period", period)
         
         data = query.execute().data or []
-        total = sum(entry.get("amount", 0.0) for entry in data)
+        
+        # Группируем данные по валютам
+        data_by_currency: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in data:
+            currency = entry.get("currency", "RUB") or "RUB"
+            if currency not in data_by_currency:
+                data_by_currency[currency] = []
+            data_by_currency[currency].append(entry)
         
         # Получаем все receipt_id из expenses
         receipt_ids = [entry.get("receipt_id") for entry in data if entry.get("receipt_id")]
@@ -881,7 +888,7 @@ class SupabaseGateway:
         if receipt_ids:
             receipts_query = (
                 self._client.table(self.receipts_table)
-                .select("id, items, store, purchased_at")
+                .select("id, items, store, purchased_at, currency")
                 .in_("id", receipt_ids)
             )
             receipts_result = receipts_query.execute().data or []
@@ -890,68 +897,84 @@ class SupabaseGateway:
                 r.get("id"): {
                     "items": r.get("items", []),
                     "store": r.get("store", ""),
-                    "purchased_at": r.get("purchased_at", "")
+                    "purchased_at": r.get("purchased_at", ""),
+                    "currency": r.get("currency", "RUB")
                 }
                 for r in receipts_result
             }
         
-        # Разбивка по категориям товаров из items чеков
-        categories = {}
-        expenses_without_receipt = []
-        
-        for entry in data:
-            receipt_id = entry.get("receipt_id")
-            if receipt_id and receipt_id in receipts_data:
-                # Берем категории из items чека
-                items = receipts_data[receipt_id]
-                if items and isinstance(items, list) and len(items) > 0:
-                    # Есть items - суммируем по категориям товаров
-                    for item in items:
-                        if isinstance(item, dict):
-                            item_category = item.get("category")
-                            item_price = float(item.get("price", 0.0))
-                            if item_category:
-                                categories[item_category] = categories.get(item_category, 0.0) + item_price
-                            else:
-                                # Если категории нет, используем "Другое"
-                                categories["Другое"] = categories.get("Другое", 0.0) + item_price
+        # Обрабатываем данные по каждой валюте отдельно
+        currencies_data = {}
+        for currency, currency_data in data_by_currency.items():
+            total = sum(entry.get("amount", 0.0) for entry in currency_data)
+            
+            # Разбивка по категориям товаров из items чеков
+            categories = {}
+            expenses_without_receipt = []
+            
+            for entry in currency_data:
+                receipt_id = entry.get("receipt_id")
+                if receipt_id and receipt_id in receipts_data:
+                    # Берем категории из items чека
+                    items = receipts_data[receipt_id]
+                    if items and isinstance(items, list) and len(items) > 0:
+                        # Есть items - суммируем по категориям товаров
+                        for item in items:
+                            if isinstance(item, dict):
+                                item_category = item.get("category")
+                                item_price = float(item.get("price", 0.0))
+                                if item_category:
+                                    categories[item_category] = categories.get(item_category, 0.0) + item_price
+                                else:
+                                    # Если категории нет, используем "Другое"
+                                    categories["Другое"] = categories.get("Другое", 0.0) + item_price
+                    else:
+                        # Нет items в чеке - используем категорию из expense или "Другое"
+                        expenses_without_receipt.append(entry)
                 else:
-                    # Нет items в чеке - используем категорию из expense или "Другое"
+                    # Нет чека - используем категорию из expense или "Другое"
                     expenses_without_receipt.append(entry)
-            else:
-                # Нет чека - используем категорию из expense или "Другое"
-                expenses_without_receipt.append(entry)
-        
-        # Обрабатываем расходы без чеков или без items
-        for entry in expenses_without_receipt:
-            category = entry.get("category") or "Другое"
-            amount = entry.get("amount", 0.0)
-            categories[category] = categories.get(category, 0.0) + amount
-        
-        # Разбивка по магазинам
-        stores = {}
-        for entry in data:
-            store = entry.get("store") or "Без названия"
-            amount = entry.get("amount", 0.0)
-            stores[store] = stores.get(store, 0.0) + amount
-        
-        # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
-        daily = {}
-        for entry in data:
-            date_str = entry.get("date", "")
-            if date_str:
-                day = date_str[:10]  # YYYY-MM-DD
+            
+            # Обрабатываем расходы без чеков или без items
+            for entry in expenses_without_receipt:
+                category = entry.get("category") or "Другое"
                 amount = entry.get("amount", 0.0)
-                daily[day] = daily.get(day, 0.0) + amount
+                categories[category] = categories.get(category, 0.0) + amount
+            
+            # Разбивка по магазинам
+            stores = {}
+            for entry in currency_data:
+                store = entry.get("store") or "Без названия"
+                amount = entry.get("amount", 0.0)
+                stores[store] = stores.get(store, 0.0) + amount
+            
+            # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
+            daily = {}
+            for entry in currency_data:
+                date_str = entry.get("date", "")
+                if date_str:
+                    day = date_str[:10]  # YYYY-MM-DD
+                    amount = entry.get("amount", 0.0)
+                    daily[day] = daily.get(day, 0.0) + amount
+            
+            currencies_data[currency] = {
+                "total": total,
+                "by_category": categories,
+                "by_store": stores,
+                "by_day": daily,
+                "entries": currency_data,
+            }
         
-        # Поиск самой дорогой покупки (из items чеков)
+        # Поиск самой дорогой покупки (из items чеков) - по всем валютам
         most_expensive_item = None
         most_expensive_item_price = 0.0
         most_expensive_item_store = ""
         most_expensive_item_date = ""
+        most_expensive_item_currency = ""
         
         for receipt_id, receipt_info in receipts_full_data.items():
             items = receipt_info.get("items", [])
+            currency = receipt_info.get("currency", "RUB")
             if items and isinstance(items, list):
                 for item in items:
                     if isinstance(item, dict):
@@ -961,19 +984,23 @@ class SupabaseGateway:
                             most_expensive_item = item.get("name", "Неизвестно")
                             most_expensive_item_store = receipt_info.get("store", "Неизвестно")
                             most_expensive_item_date = receipt_info.get("purchased_at", "")
+                            most_expensive_item_currency = currency
         
-        # Поиск самой дорогой траты (из expenses)
+        # Поиск самой дорогой траты (из expenses) - по всем валютам
         most_expensive_expense = None
         most_expensive_expense_amount = 0.0
         most_expensive_expense_store = ""
         most_expensive_expense_date = ""
+        most_expensive_expense_currency = ""
         
         for entry in data:
             amount = float(entry.get("amount", 0.0))
+            currency = entry.get("currency", "RUB")
             if amount > most_expensive_expense_amount:
                 most_expensive_expense_amount = amount
                 most_expensive_expense_store = entry.get("store", "Неизвестно")
                 most_expensive_expense_date = entry.get("date", "")
+                most_expensive_expense_currency = currency
         
         # Определяем период для отображения
         display_period = period
@@ -984,21 +1011,19 @@ class SupabaseGateway:
         
         return {
             "period": display_period,
-            "total": total,
-            "entries": data,
-            "by_category": categories,
-            "by_store": stores,
-            "by_day": daily,
+            "currencies_data": currencies_data,
             "most_expensive_item": {
                 "name": most_expensive_item,
                 "price": most_expensive_item_price,
                 "store": most_expensive_item_store,
-                "date": most_expensive_item_date
+                "date": most_expensive_item_date,
+                "currency": most_expensive_item_currency
             } if most_expensive_item else None,
             "most_expensive_expense": {
                 "amount": most_expensive_expense_amount,
                 "store": most_expensive_expense_store,
-                "date": most_expensive_expense_date
+                "date": most_expensive_expense_date,
+                "currency": most_expensive_expense_currency
             } if most_expensive_expense_amount > 0 else None,
         }
 
@@ -1340,15 +1365,13 @@ class ExpenseCatBot:
         
         # Настраиваем меню команд
         commands = [
-            BotCommand(command="receipt", description="Добавить чек (фото)"),
             BotCommand(command="expense", description="Добавить расход вручную"),
-            BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="report", description="Получить отчёт"),
+            BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
             BotCommand(command="delete_expense", description="Удалить трату"),
             BotCommand(command="delete_all", description="Удалить все данные"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
-            BotCommand(command="cancel", description="Отменить операцию"),
         ]
         await self.bot.set_my_commands(commands)
         logging.info("Bot commands menu configured")
@@ -1392,11 +1415,10 @@ class ExpenseCatBot:
             await message.answer(
                 "Привет! Я ExpenseCatBot — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
                 "Команды:\n"
-                "/receipt — загрузить чек\n"
-                "/statement — импортировать выписку\n"
+                "/expense — добавить расход вручную\n"
                 "/report — получить краткий отчёт\n"
-                "/settings — настройки\n"
-                "/cancel — сброс действия"
+                "/statement — импортировать выписку\n"
+                "/settings — настройки"
             )
 
         @self.router.message(Command("cancel"))
@@ -2171,10 +2193,9 @@ class ExpenseCatBot:
                     await callback.message.answer(
                         f"✅ Валюта по умолчанию установлена: {symbol} {currency}\n\n"
                         "Теперь вы можете использовать бота:\n"
-                        "/receipt — загрузить чек\n"
-                        "/statement — импортировать выписку\n"
+                        "/expense — добавить расход вручную\n"
                         "/report — получить краткий отчёт\n"
-                        "/expense — добавить расход вручную"
+                        "/statement — импортировать выписку"
                     )
             else:
                 await callback.message.answer("❌ Ошибка при сохранении настроек. Попробуйте еще раз.")
@@ -2989,13 +3010,11 @@ def generate_receipt_image(parsed: ParsedReceipt) -> Optional[bytes]:
 
 def format_report(report: Dict[str, Any]) -> str:
     """
-    Форматирует отчет с разбивкой по категориям, топ категорий/магазинов и графиком по дням.
+    Форматирует отчет с разбивкой по категориям, топ категорий/магазинов.
+    Поддерживает мультивалютные отчеты.
     """
     period = report.get("period", "")
-    total = report.get("total", 0.0)
-    by_category = report.get("by_category", {})
-    by_store = report.get("by_store", {})
-    by_day = report.get("by_day", {})
+    currencies_data = report.get("currencies_data", {})
     
     # Форматируем период для отображения
     display_period = period
@@ -3021,8 +3040,38 @@ def format_report(report: Dict[str, Any]) -> str:
             pass
     
     lines = [f"📊 Отчёт за {display_period}"]
-    lines.append(f"💰 Всего расходов: {total:.2f}")
-    lines.append("")
+    
+    # Символы валют
+    currency_symbols = {
+        "RUB": "₽",
+        "KZT": "₸",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "GEL": "₾",
+    }
+    
+    # Если есть несколько валют, показываем отдельно по каждой
+    if len(currencies_data) > 1:
+        lines.append("💰 Итого по валютам:")
+        for currency in sorted(currencies_data.keys()):
+            currency_info = currencies_data[currency]
+            total = currency_info.get("total", 0.0)
+            symbol = currency_symbols.get(currency, currency)
+            lines.append(f"  {symbol} {total:.2f}")
+        lines.append("")
+    elif len(currencies_data) == 1:
+        # Одна валюта - показываем просто итог
+        currency = list(currencies_data.keys())[0]
+        currency_info = currencies_data[currency]
+        total = currency_info.get("total", 0.0)
+        symbol = currency_symbols.get(currency, currency)
+        lines.append(f"💰 Всего расходов: {total:.2f} {symbol}")
+        lines.append("")
+    else:
+        # Нет данных
+        lines.append("💰 Всего расходов: 0.00")
+        lines.append("")
     
     # Самая дорогая покупка и трата
     most_expensive_item = report.get("most_expensive_item")
@@ -3047,17 +3096,21 @@ def format_report(report: Dict[str, Any]) -> str:
                 date_str = item_date[:10] if len(item_date) >= 10 else item_date
         
         store_name = item_store[:30] if len(item_store) > 30 else item_store
+        item_currency = most_expensive_item.get("currency", "RUB")
+        item_symbol = currency_symbols.get(item_currency, item_currency)
         lines.append("💎 Самая дорогая покупка:")
         if date_str:
-            lines.append(f"  {item_name} - {item_price:.2f} ({store_name}, {date_str})")
+            lines.append(f"  {item_name} - {item_price:.2f} {item_symbol} ({store_name}, {date_str})")
         else:
-            lines.append(f"  {item_name} - {item_price:.2f} ({store_name})")
+            lines.append(f"  {item_name} - {item_price:.2f} {item_symbol} ({store_name})")
         lines.append("")
     
     if most_expensive_expense and most_expensive_expense.get("amount", 0) > 0:
         exp_amount = most_expensive_expense.get("amount", 0.0)
         exp_store = most_expensive_expense.get("store", "Неизвестно")
         exp_date = most_expensive_expense.get("date", "")
+        exp_currency = most_expensive_expense.get("currency", "RUB")
+        exp_symbol = currency_symbols.get(exp_currency, exp_currency)
         
         # Форматируем дату
         date_str = ""
@@ -3071,31 +3124,45 @@ def format_report(report: Dict[str, Any]) -> str:
         store_name = exp_store[:30] if len(exp_store) > 30 else exp_store
         lines.append("💸 Самая дорогая трата:")
         if date_str:
-            lines.append(f"  {exp_amount:.2f} - {store_name} ({date_str})")
+            lines.append(f"  {exp_amount:.2f} {exp_symbol} - {store_name} ({date_str})")
         else:
-            lines.append(f"  {exp_amount:.2f} - {store_name}")
+            lines.append(f"  {exp_amount:.2f} {exp_symbol} - {store_name}")
         lines.append("")
     
-    # Разбивка по категориям
-    if by_category:
-        lines.append("📂 По категориям:")
-        sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
-        for category, amount in sorted_categories[:10]:  # Топ 10
-            percentage = (amount / total * 100) if total > 0 else 0
-            lines.append(f"  • {category}: {amount:.2f} ({percentage:.1f}%)")
-        lines.append("")
-    
-    # Топ магазинов
-    if by_store:
-        lines.append("🏪 Топ магазинов:")
-        sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
-        for store, amount in sorted_stores[:5]:  # Топ 5
-            percentage = (amount / total * 100) if total > 0 else 0
-            # Нормализуем название магазина для отображения (на случай старых данных)
-            store_name = normalize_store_name(store)
-            store_name = store_name[:40] if len(store_name) > 40 else store_name
-            lines.append(f"  • {store_name}: {amount:.2f} ({percentage:.1f}%)")
-        lines.append("")
+    # Формируем отчет по каждой валюте отдельно
+    for currency in sorted(currencies_data.keys()):
+        currency_info = currencies_data[currency]
+        total = currency_info.get("total", 0.0)
+        by_category = currency_info.get("by_category", {})
+        by_store = currency_info.get("by_store", {})
+        symbol = currency_symbols.get(currency, currency)
+        
+        # Заголовок для валюты (если несколько валют)
+        if len(currencies_data) > 1:
+            lines.append(f"━━━ {symbol} ━━━")
+            lines.append(f"💰 Итого: {total:.2f} {symbol}")
+            lines.append("")
+        
+        # Разбивка по категориям
+        if by_category:
+            lines.append("📂 По категориям:")
+            sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
+            for category, amount in sorted_categories[:10]:  # Топ 10
+                percentage = (amount / total * 100) if total > 0 else 0
+                lines.append(f"  • {category}: {amount:.2f} {symbol} ({percentage:.1f}%)")
+            lines.append("")
+        
+        # Топ магазинов
+        if by_store:
+            lines.append("🏪 Топ магазинов:")
+            sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
+            for store, amount in sorted_stores[:5]:  # Топ 5
+                percentage = (amount / total * 100) if total > 0 else 0
+                # Нормализуем название магазина для отображения
+                store_name = normalize_store_name(store)
+                store_name = store_name[:40] if len(store_name) > 40 else store_name
+                lines.append(f"  • {store_name}: {amount:.2f} {symbol} ({percentage:.1f}%)")
+            lines.append("")
     
     return "\n".join(lines)
 
