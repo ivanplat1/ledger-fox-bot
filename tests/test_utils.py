@@ -3,7 +3,7 @@ Unit tests for utility functions
 """
 import pytest
 from datetime import datetime
-from ledger_fox_bot import (
+from expense_cat_bot import (
     normalize_store_name,
     parse_datetime_flexible,
     safe_float,

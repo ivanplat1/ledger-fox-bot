@@ -1,4 +1,4 @@
-# Настройка Supabase для LedgerFox Bot
+# Настройка Supabase для ExpenseCatBot
 
 ## Шаг 1: Создание проекта в Supabase
 

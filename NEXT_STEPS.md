@@ -5,7 +5,7 @@
 Убедитесь, что в вашем `.env` файле (или в переменных окружения) указаны:
 
 ```env
-LEDGERFOX_BOT_TOKEN=your-telegram-bot-token
+EXPENSECAT_BOT_TOKEN=your-telegram-bot-token
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 OPENAI_API_KEY=your-openai-api-key

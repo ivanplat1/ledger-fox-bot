@@ -1,6 +1,6 @@
 # Testing Guide
 
-This document describes how to run and write tests for the LedgerFox bot.
+This document describes how to run and write tests for the ExpenseCatBot.
 
 ## Setup
 
@@ -16,7 +16,7 @@ pytest
 
 3. Run with coverage:
 ```bash
-pytest --cov=ledger_fox_bot --cov-report=html
+pytest --cov=expense_cat_bot --cov-report=html
 ```
 
 4. Run specific test file:
@@ -165,7 +165,7 @@ See `.github/workflows/tests.yml` for configuration.
 ### Tests fail with import errors
 Make sure you're running from the project root:
 ```bash
-cd /path/to/ledgerfox
+cd /path/to/expensecat
 pytest
 ```
 

@@ -3,7 +3,7 @@ Tests for SupabaseGateway class
 """
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
-from ledger_fox_bot import SupabaseGateway
+from expense_cat_bot import SupabaseGateway
 
 
 class TestSupabaseGateway:
@@ -12,7 +12,7 @@ class TestSupabaseGateway:
     @pytest.fixture
     def gateway(self):
         """Create a SupabaseGateway instance with mocked client"""
-        with patch('ledger_fox_bot.create_client') as mock_create_client:
+        with patch('expense_cat_bot.create_client') as mock_create_client:
             mock_client = Mock()
             mock_create_client.return_value = mock_client
             gateway = SupabaseGateway(

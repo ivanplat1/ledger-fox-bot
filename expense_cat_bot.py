@@ -97,16 +97,16 @@ except (ModuleNotFoundError, ImportError):  # pragma: no cover - import guard
 
 
 load_dotenv()
-log_level_name = os.getenv("LEDGERFOX_LOG_LEVEL", "INFO").upper()
+log_level_name = os.getenv("EXPENSECAT_LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
 logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
-log_dir = Path(os.getenv("LEDGERFOX_LOG_DIR", "logs"))
+log_dir = Path(os.getenv("EXPENSECAT_LOG_DIR", "logs"))
 log_dir.mkdir(parents=True, exist_ok=True)
 file_handler = logging.FileHandler(log_dir / "ocr_debug.log")
 file_handler.setLevel(log_level)
 file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logging.getLogger().addHandler(file_handler)
-logging.info("LedgerFox logging configured at %s", log_level_name)
+logging.info("ExpenseCatBot logging configured at %s", log_level_name)
 logging.info("Active preprocess pipeline hash marker: portrait-fix-v3")
 
 
@@ -130,6 +130,10 @@ class ReportStates(StatesGroup):
 
 class DeleteExpenseStates(StatesGroup):
     waiting_for_confirmation = State()
+
+
+class SetupStates(StatesGroup):
+    waiting_for_currency = State()
 
 
 @dataclass
@@ -340,15 +344,16 @@ class ReceiptParserAI:
         Отправляет изображение в OpenAI и возвращает полный JSON response без изменений.
         Если передан qr_data, отправляются данные для структурирования (без изображения).
         """
-        # Если есть данные из QR-кода, отправляем их для структурирования
+        # Если есть данные из QR-кода, отправляем их для структурирования БЕЗ изображения
         if qr_data:
-            logging.info("Используем данные из QR-кода для структурирования, изображение не отправляется")
+            logging.info("Используем данные из QR-кода для структурирования, изображение НЕ отправляется")
             payload = self._build_payload("", qr_data=qr_data)
         else:
+            # Если QR-кода нет, используем изображение
             if not mime_type.startswith("image/"):
                 raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-        data_url = build_data_url(file_bytes, mime_type)
-        payload = self._build_payload(data_url)
+            data_url = build_data_url(file_bytes, mime_type)
+            payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -550,7 +555,7 @@ class ReceiptParserAI:
 
 
 class SupabaseGateway:
-    """Async helper around Supabase client used by LedgerFox."""
+    """Async helper around Supabase client used by ExpenseCatBot."""
     # TODO: добавить таблицы категорий, бюджетов и повторяющихся платежей.
 
     def __init__(
@@ -560,6 +565,7 @@ class SupabaseGateway:
         receipts_table: str = "receipts",
         bank_table: str = "bank_transactions",
         expenses_table: str = "expenses",
+        settings_table: str = "user_settings",
     ) -> None:
         if not SUPABASE_AVAILABLE or create_client is None:
             raise RuntimeError("Supabase client is not installed. Run `pip install supabase`.")
@@ -567,6 +573,7 @@ class SupabaseGateway:
         self.receipts_table = receipts_table
         self.bank_table = bank_table
         self.expenses_table = expenses_table
+        self.settings_table = settings_table
 
     async def check_receipt_exists(self, receipt_hash: str) -> bool:
         """Проверяет, существует ли чек с данным хешем."""
@@ -1186,6 +1193,85 @@ class SupabaseGateway:
         """Асинхронная обертка для удаления расхода"""
         return await asyncio.to_thread(self._delete_expense_sync, user_id, expense_id)
 
+    def _get_user_settings_sync(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получает настройки пользователя"""
+        try:
+            result = (
+                self._client.table(self.settings_table)
+                .select("default_currency")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return None
+        except Exception as exc:
+            logging.exception(f"Error fetching user settings for user={user_id}: {exc}")
+            return None
+
+    async def get_user_settings(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Асинхронная обертка для получения настроек пользователя"""
+        return await asyncio.to_thread(self._get_user_settings_sync, user_id)
+
+    def _set_user_default_currency_sync(self, user_id: int, currency: str) -> bool:
+        """Устанавливает валюту по умолчанию для пользователя"""
+        try:
+            payload = {
+                "user_id": user_id,
+                "default_currency": currency.upper(),
+            }
+            result = (
+                self._client.table(self.settings_table)
+                .upsert(payload, on_conflict="user_id", returning="representation")
+                .execute()
+            )
+            if result.data and len(result.data) > 0:
+                logging.info(f"Set default currency {currency} for user={user_id}")
+                return True
+            return False
+        except Exception as exc:
+            logging.exception(f"Error setting default currency for user={user_id}: {exc}")
+            return False
+
+    async def set_user_default_currency(self, user_id: int, currency: str) -> bool:
+        """Асинхронная обертка для установки валюты по умолчанию"""
+        return await asyncio.to_thread(self._set_user_default_currency_sync, user_id, currency)
+
+    def _check_user_has_data_sync(self, user_id: int) -> bool:
+        """Проверяет, есть ли у пользователя какие-либо данные (чеки, расходы)"""
+        try:
+            # Проверяем наличие расходов
+            expenses_result = (
+                self._client.table(self.expenses_table)
+                .select("id")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if expenses_result.data and len(expenses_result.data) > 0:
+                return True
+            
+            # Проверяем наличие чеков
+            receipts_result = (
+                self._client.table(self.receipts_table)
+                .select("id")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if receipts_result.data and len(receipts_result.data) > 0:
+                return True
+            
+            return False
+        except Exception as exc:
+            logging.exception(f"Error checking user data for user={user_id}: {exc}")
+            return False
+
+    async def check_user_has_data(self, user_id: int) -> bool:
+        """Асинхронная обертка для проверки наличия данных у пользователя"""
+        return await asyncio.to_thread(self._check_user_has_data_sync, user_id)
+
 
 def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
     """
@@ -1203,26 +1289,43 @@ def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
     return truncated + "\n\n... (сообщение обрезано, слишком длинное)"
 
 
-class LedgerFoxBot:
+class ExpenseCatBot:
     """Telegram bot orchestrating OCR, bank parsing, and Supabase storage."""
 
     def __init__(self, token: str, supabase_gateway: Optional[SupabaseGateway] = None) -> None:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
-        self.router = Router(name="ledgerfox")
+        self.router = Router(name="expensecat")
         self.supabase = supabase_gateway
         self._media_group_cache: Dict[str, List[Message]] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         self.dp.include_router(self.router)
         self._register_handlers()
 
+    def _create_currency_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру для выбора валюты"""
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="₽ RUB", callback_data="setup_currency_RUB"),
+                InlineKeyboardButton(text="₸ KZT", callback_data="setup_currency_KZT"),
+            ],
+            [
+                InlineKeyboardButton(text="$ USD", callback_data="setup_currency_USD"),
+                InlineKeyboardButton(text="€ EUR", callback_data="setup_currency_EUR"),
+            ],
+            [
+                InlineKeyboardButton(text="£ GBP", callback_data="setup_currency_GBP"),
+                InlineKeyboardButton(text="₾ GEL", callback_data="setup_currency_GEL"),
+            ],
+        ])
+
     @classmethod
-    def from_env(cls) -> "LedgerFoxBot":
-        token = os.getenv("LEDGERFOX_BOT_TOKEN")
+    def from_env(cls) -> "ExpenseCatBot":
+        token = os.getenv("EXPENSECAT_BOT_TOKEN")
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         if not token:
-            raise RuntimeError("LEDGERFOX_BOT_TOKEN is required to run LedgerFox.")
+            raise RuntimeError("EXPENSECAT_BOT_TOKEN is required to run ExpenseCatBot.")
         gateway = None
         if supabase_url and supabase_key:
             gateway = SupabaseGateway(url=supabase_url, service_key=supabase_key)
@@ -1233,7 +1336,7 @@ class LedgerFoxBot:
         return cls(token=token, supabase_gateway=gateway)
 
     async def run(self) -> None:
-        logging.info("Starting LedgerFox bot")
+        logging.info("Starting ExpenseCatBot")
         
         # Настраиваем меню команд
         commands = [
@@ -1244,6 +1347,7 @@ class LedgerFoxBot:
             BotCommand(command="export", description="Экспорт данных в CSV"),
             BotCommand(command="delete_expense", description="Удалить трату"),
             BotCommand(command="delete_all", description="Удалить все данные"),
+            BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
             BotCommand(command="cancel", description="Отменить операцию"),
         ]
         await self.bot.set_my_commands(commands)
@@ -1265,12 +1369,33 @@ class LedgerFoxBot:
         @self.router.message(CommandStart())
         async def handle_start(message: Message, state: FSMContext) -> None:
             await state.clear()
+            
+            # Проверяем, есть ли у пользователя настройки
+            if self.supabase and message.from_user:
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                
+                # Если настроек нет и нет данных - предлагаем выбрать валюту
+                if not settings:
+                    has_data = await self.supabase.check_user_has_data(message.from_user.id)
+                    if not has_data:
+                        # Первый запуск - предлагаем выбрать валюту
+                        keyboard = self._create_currency_keyboard()
+                        await message.answer(
+                            "👋 Привет! Я ExpenseCatBot — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
+                            "💰 Выберите валюту по умолчанию:",
+                            reply_markup=keyboard
+                        )
+                        await state.set_state(SetupStates.waiting_for_currency)
+                        return
+            
+            # Обычное приветствие для существующих пользователей
             await message.answer(
-                "Привет! Я LedgerFox — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
+                "Привет! Я ExpenseCatBot — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
                 "Команды:\n"
                 "/receipt — загрузить чек\n"
                 "/statement — импортировать выписку\n"
                 "/report — получить краткий отчёт\n"
+                "/settings — настройки\n"
                 "/cancel — сброс действия"
             )
 
@@ -1370,7 +1495,7 @@ class LedgerFoxBot:
                     period = parts[1].strip()
             await message.answer("Формирую выгрузку, это может занять пару секунд…")
             csv_blob = await self.supabase.export_expenses_csv(message.from_user.id, period)
-            filename = f"ledgerfox_export_{period or 'all'}.csv"
+            filename = f"expensecat_export_{period or 'all'}.csv"
             file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
             await message.answer_document(
                 document=file,
@@ -1420,7 +1545,7 @@ class LedgerFoxBot:
             
             if not self.supabase:
                 await callback.message.answer("Отчёты по расходам появятся после подключения базы (Supabase).")
-            return
+                return
             
             now = datetime.utcnow()
             period = None
@@ -1698,6 +1823,24 @@ class LedgerFoxBot:
         @self.router.message(Command("expense"))
         async def handle_expense_entry(message: Message, state: FSMContext) -> None:
             await state.clear()
+            
+            # Получаем валюту по умолчанию пользователя
+            default_currency = "RUB"
+            if self.supabase and message.from_user:
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                if settings and settings.get("default_currency"):
+                    default_currency = settings.get("default_currency")
+            
+            currency_symbols = {
+                "RUB": "₽",
+                "KZT": "₸",
+                "USD": "$",
+                "EUR": "€",
+                "GBP": "£",
+                "GEL": "₾",
+            }
+            default_symbol = currency_symbols.get(default_currency, default_currency)
+            
             instructions = (
                 "💳 Добавление расхода вручную\n\n"
                 "Отправьте расход в формате:\n"
@@ -1708,16 +1851,58 @@ class LedgerFoxBot:
                 "• Такси 1200 KZT\n"
                 "• Продукты 2500 руб 03.12\n"
                 "• Ресторан 5000 KZT 2025-12-03\n\n"
+                f"Валюта по умолчанию: {default_symbol} {default_currency}\n"
                 "Валюта определяется автоматически (RUB, KZT, USD и др.)\n"
+                "Если валюта не указана, используется валюта по умолчанию.\n"
                 "Если дата не указана, используется сегодняшняя."
             )
             await message.answer(instructions)
+
+        @self.router.message(Command("settings"))
+        async def handle_settings(message: Message, state: FSMContext) -> None:
+            """Обработчик команды настроек"""
+            await state.clear()
+            
+            if not self.supabase or not message.from_user:
+                await message.answer("❌ Настройки доступны только при подключенной базе данных.")
+                return
+            
+            # Получаем текущие настройки
+            settings = await self.supabase.get_user_settings(message.from_user.id)
+            current_currency = settings.get("default_currency", "RUB") if settings else "RUB"
+            
+            currency_symbols = {
+                "RUB": "₽",
+                "KZT": "₸",
+                "USD": "$",
+                "EUR": "€",
+                "GBP": "£",
+                "GEL": "₾",
+            }
+            current_symbol = currency_symbols.get(current_currency, current_currency)
+            
+            keyboard = self._create_currency_keyboard()
+            await message.answer(
+                f"⚙️ Настройки\n\n"
+                f"💰 Текущая валюта по умолчанию: {current_symbol} {current_currency}\n\n"
+                f"Выберите новую валюту:",
+                reply_markup=keyboard
+            )
+            await state.set_state(SetupStates.waiting_for_currency)
 
         @self.router.message(F.text)
         async def handle_text_expense(message: Message, state: FSMContext) -> None:
             if not message.text or message.text.startswith("/"):
                 return
-            parsed = parse_manual_expense(message.text)
+            
+            # Получаем валюту по умолчанию пользователя
+            default_currency = "RUB"
+            if self.supabase and message.from_user:
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                if settings and settings.get("default_currency"):
+                    default_currency = settings.get("default_currency")
+            
+            parsed = parse_manual_expense(message.text, default_currency=default_currency)
             if not parsed:
                 return
             await state.clear()
@@ -1938,6 +2123,62 @@ class LedgerFoxBot:
             """Обработчик отмены удаления траты"""
             await callback.answer()
             await callback.message.answer("❌ Удаление траты отменено.")
+            await state.clear()
+
+        @self.router.callback_query(F.data.startswith("setup_currency_"))
+        async def handle_setup_currency(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик выбора валюты при первом запуске или изменении настроек"""
+            await callback.answer()
+            
+            if not self.supabase or not callback.from_user:
+                await callback.message.answer("❌ Ошибка: база данных не подключена.")
+                await state.clear()
+                return
+            
+            # Извлекаем валюту из callback_data
+            currency = callback.data.replace("setup_currency_", "").upper()
+            
+            # Проверяем, что валюта валидна
+            valid_currencies = ["RUB", "KZT", "USD", "EUR", "GBP", "GEL", "BYN", "KGS", "CNY", "CHF", "AED", "CAD", "AUD"]
+            if currency not in valid_currencies:
+                await callback.message.answer("❌ Неверная валюта. Попробуйте еще раз.")
+                return
+            
+            # Сохраняем валюту
+            success = await self.supabase.set_user_default_currency(callback.from_user.id, currency)
+            
+            if success:
+                currency_symbols = {
+                    "RUB": "₽",
+                    "KZT": "₸",
+                    "USD": "$",
+                    "EUR": "€",
+                    "GBP": "£",
+                    "GEL": "₾",
+                }
+                symbol = currency_symbols.get(currency, currency)
+                
+                # Проверяем, это первый запуск или изменение настроек
+                settings = await self.supabase.get_user_settings(callback.from_user.id)
+                if settings and settings.get("default_currency"):
+                    # Изменение настроек
+                    await callback.message.answer(
+                        f"✅ Валюта по умолчанию изменена на: {symbol} {currency}\n\n"
+                        f"Теперь при добавлении расходов без указания валюты будет использоваться {symbol} {currency}."
+                    )
+                else:
+                    # Первый запуск
+                    await callback.message.answer(
+                        f"✅ Валюта по умолчанию установлена: {symbol} {currency}\n\n"
+                        "Теперь вы можете использовать бота:\n"
+                        "/receipt — загрузить чек\n"
+                        "/statement — импортировать выписку\n"
+                        "/report — получить краткий отчёт\n"
+                        "/expense — добавить расход вручную"
+                    )
+            else:
+                await callback.message.answer("❌ Ошибка при сохранении настроек. Попробуйте еще раз.")
+            
             await state.clear()
 
     async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
@@ -6531,7 +6772,7 @@ MANUAL_AMOUNT_PATTERN = re.compile(
 MANUAL_DATE_PATTERN = re.compile(r"(\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)")
 
 
-def parse_manual_expense(text: str) -> Optional[ParsedManualExpense]:
+def parse_manual_expense(text: str, default_currency: str = "RUB") -> Optional[ParsedManualExpense]:
     cleaned = " ".join((text or "").strip().split())
     if len(cleaned) < 3:
         return None
@@ -6543,7 +6784,7 @@ def parse_manual_expense(text: str) -> Optional[ParsedManualExpense]:
     detected_currency = (
         _currency_from_value(token_currency)
         or _currency_from_value(cleaned)
-        or "RUB"
+        or default_currency
     )
     date_match = MANUAL_DATE_PATTERN.search(cleaned)
     occurred_at = (
@@ -6692,7 +6933,7 @@ _KNOWN_ISO_CODES = {
 
 
 async def main() -> None:
-    bot = LedgerFoxBot.from_env()
+    bot = ExpenseCatBot.from_env()
     await bot.run()
 
 

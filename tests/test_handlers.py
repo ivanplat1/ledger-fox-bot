@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from ledger_fox_bot import LedgerFoxBot, DeleteExpenseStates
+from expense_cat_bot import ExpenseCatBot, DeleteExpenseStates
 
 
 class TestDeleteExpenseHandler:
@@ -14,17 +14,17 @@ class TestDeleteExpenseHandler:
     @pytest.fixture
     def bot(self):
         """Create a bot instance for testing"""
-        from ledger_fox_bot import SupabaseGateway
+        from expense_cat_bot import SupabaseGateway
         from unittest.mock import patch
         
         mock_supabase = Mock(spec=SupabaseGateway)
         
         # Mock Bot to avoid token validation
-        with patch('ledger_fox_bot.Bot') as mock_bot_class:
+        with patch('expense_cat_bot.Bot') as mock_bot_class:
             mock_bot = Mock()
             mock_bot_class.return_value = mock_bot
             
-            bot = LedgerFoxBot(
+            bot = ExpenseCatBot(
                 token="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz",
                 supabase_gateway=mock_supabase
             )
