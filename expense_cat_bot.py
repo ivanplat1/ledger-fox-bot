@@ -128,6 +128,11 @@ class ReportStates(StatesGroup):
     waiting_for_end_date = State()
 
 
+class ExportStates(StatesGroup):
+    waiting_for_start_date = State()
+    waiting_for_end_date = State()
+
+
 class DeleteExpenseStates(StatesGroup):
     waiting_for_confirmation = State()
 
@@ -761,12 +766,21 @@ class SupabaseGateway:
             end_date,
         )
 
-    async def export_expenses_csv(self, user_id: int, period: Optional[str]) -> str:
-        logging.info("Exporting expenses for user=%s period=%s", user_id, period or "all")
+    async def export_expenses_csv(
+        self, 
+        user_id: int, 
+        period: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> str:
+        logging.info("Exporting expenses for user=%s period=%s start_date=%s end_date=%s", 
+                     user_id, period or "all", start_date or "none", end_date or "none")
         return await asyncio.to_thread(
             self._export_expenses_csv_sync,
             user_id,
             period,
+            start_date,
+            end_date,
         )
 
     async def delete_all_user_data(self, user_id: int) -> Dict[str, int]:
@@ -986,7 +1000,7 @@ class SupabaseGateway:
                             most_expensive_item_date = receipt_info.get("purchased_at", "")
                             most_expensive_item_currency = currency
         
-        # Поиск самой дорогой траты (из expenses) - по всем валютам
+        # Поиск самого дорогого расхода (из expenses) - по всем валютам
         most_expensive_expense = None
         most_expensive_expense_amount = 0.0
         most_expensive_expense_store = ""
@@ -1027,19 +1041,59 @@ class SupabaseGateway:
             } if most_expensive_expense_amount > 0 else None,
         }
 
-    def _export_expenses_csv_sync(self, user_id: int, period: Optional[str]) -> str:
+    def _export_expenses_csv_sync(
+        self, 
+        user_id: int, 
+        period: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> str:
         query = self._client.table(self.expenses_table).select("*").eq("user_id", user_id)
         if period:
             query = query.ilike("period", f"{period}%")
+        elif start_date and end_date:
+            query = query.gte("date", start_date).lte("date", end_date)
+        elif start_date:
+            query = query.gte("date", start_date)
+        elif end_date:
+            query = query.lte("date", end_date)
         data = query.execute().data or []
         if not data:
-            return "user_id,store,amount,currency,date,source,note\n"
-        fieldnames = sorted({field for row in data for field in row.keys()})
+            return "id,store,currency,date,source,category,note,bank_transaction_id,receipt_id,status,amount\n"
+        
+        # Поля, которые нужно исключить
+        excluded_fields = {"created_at", "expense_hash", "period", "updated_at", "user_id"}
+        
+        # Получаем все поля из данных, исключая ненужные
+        all_fields = {field for row in data for field in row.keys() if field not in excluded_fields}
+        
+        # Определяем порядок полей: id в начале, amount в конце, остальные по алфавиту
+        priority_fields = ["id"]
+        end_fields = ["amount"]
+        middle_fields = sorted(all_fields - set(priority_fields) - set(end_fields))
+        fieldnames = priority_fields + middle_fields + end_fields
+        
         buffer = io.StringIO()
         writer = csv.DictWriter(buffer, fieldnames=fieldnames)
         writer.writeheader()
         for row in data:
-            writer.writerow({key: row.get(key) for key in fieldnames})
+            # Форматируем данные для записи
+            formatted_row = {}
+            for key in fieldnames:
+                value = row.get(key)
+                # Если это поле date, убираем время (оставляем только дату)
+                if key == "date" and value:
+                    if isinstance(value, str):
+                        # Если дата в формате ISO с временем, берем только дату
+                        if "T" in value:
+                            value = value.split("T")[0]
+                        elif " " in value:
+                            value = value.split(" ")[0]
+                    elif hasattr(value, 'strftime'):
+                        # Если это объект datetime/date, форматируем как дату
+                        value = value.strftime("%Y-%m-%d")
+                formatted_row[key] = value
+            writer.writerow(formatted_row)
         return buffer.getvalue()
 
     def _delete_all_user_data_sync(self, user_id: int) -> Dict[str, int]:
@@ -1369,7 +1423,7 @@ class ExpenseCatBot:
             BotCommand(command="report", description="Получить отчёт"),
             BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
-            BotCommand(command="delete_expense", description="Удалить трату"),
+            BotCommand(command="delete_expense", description="Удалить расход"),
             BotCommand(command="delete_all", description="Удалить все данные"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
         ]
@@ -1404,8 +1458,15 @@ class ExpenseCatBot:
                         # Первый запуск - предлагаем выбрать валюту
                         keyboard = self._create_currency_keyboard()
                         await message.answer(
-                            "👋 Привет! Я ExpenseCatBot — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
-                            "💰 Выберите валюту по умолчанию:",
+                            "👋 Привет! Я помогу вам вести учёт расходов.\n\n"
+                            "✨ Что я умею:\n"
+                            "📸 Распознаю чеки по фото (OCR + QR-коды)\n"
+                            "📝 Добавляю расходы вручную\n"
+                            "🏦 Импортирую выписки из банка\n"
+                            "📊 Создаю отчёты по категориям и магазинам\n"
+                            "💰 Поддерживаю несколько валют\n"
+                            "📤 Экспортирую данные в CSV\n\n"
+                            "💰 Для начала выберите валюту по умолчанию:",
                             reply_markup=keyboard
                         )
                         await state.set_state(SetupStates.waiting_for_currency)
@@ -1413,11 +1474,20 @@ class ExpenseCatBot:
             
             # Обычное приветствие для существующих пользователей
             await message.answer(
-                "Привет! Я ExpenseCatBot — распознаю чеки, сверяю с выписками и делаю отчёты.\n\n"
-                "Команды:\n"
+                "👋 Привет! Я помогу вам вести учёт расходов.\n\n"
+                "✨ Основные возможности:\n"
+                "📸 Отправляйте фото чеков — распознаю автоматически\n"
+                "📝 Добавляйте расходы вручную текстом\n"
+                "🏦 Импортируйте банковские выписки\n"
+                "📊 Получайте отчёты по категориям, магазинам и периодам\n"
+                "💰 Поддерживаю несколько валют\n"
+                "📤 Экспортируйте данные в CSV\n\n"
+                "📋 Команды:\n"
                 "/expense — добавить расход вручную\n"
-                "/report — получить краткий отчёт\n"
+                "/report — получить отчёт\n"
                 "/statement — импортировать выписку\n"
+                "/export — экспорт в CSV\n"
+                "/delete_expense — удалить расход\n"
                 "/settings — настройки"
             )
 
@@ -1510,18 +1580,28 @@ class ExpenseCatBot:
             if not self.supabase:
                 await message.answer("Экспорт доступен после подключения Supabase.")
                 return
-            period = None
-            if message.text:
-                parts = message.text.split(maxsplit=1)
-                if len(parts) == 2:
-                    period = parts[1].strip()
-            await message.answer("Формирую выгрузку, это может занять пару секунд…")
-            csv_blob = await self.supabase.export_expenses_csv(message.from_user.id, period)
-            filename = f"expensecat_export_{period or 'all'}.csv"
-            file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
-            await message.answer_document(
-                document=file,
-                caption="Готово. Используй CSV в Excel/Sheets или импортируй обратно.",
+            
+            # Показываем меню выбора периода
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📅 Текущий месяц", callback_data="export_current_month"),
+                    InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="export_last_month"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущая неделя", callback_data="export_current_week"),
+                    InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="export_last_week"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущий год", callback_data="export_current_year"),
+                    InlineKeyboardButton(text="📅 Произвольный период", callback_data="export_custom"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Все данные", callback_data="export_all"),
+                ],
+            ])
+            await message.answer(
+                "📤 Выберите период для экспорта:",
+                reply_markup=keyboard
             )
 
         @self.router.message(Command("import"))
@@ -1618,6 +1698,159 @@ class ExpenseCatBot:
             # Обрезаем если слишком длинный
             truncated_report = truncate_message_for_telegram(report_text)
             await callback.message.answer(truncated_report)
+        
+        @self.router.callback_query(F.data.startswith("export_"))
+        async def handle_export_period(callback: CallbackQuery, state: FSMContext) -> None:
+            await callback.answer()
+            
+            if not self.supabase:
+                await callback.message.answer("Экспорт доступен после подключения Supabase.")
+                return
+            
+            now = datetime.utcnow()
+            period = None
+            start_date = None
+            end_date = None
+            
+            if callback.data == "export_current_month":
+                period = now.strftime("%Y-%m")
+            elif callback.data == "export_last_month":
+                # Прошлый месяц
+                last_month = (now.replace(day=1) - timedelta(days=1))
+                period = last_month.strftime("%Y-%m")
+            elif callback.data == "export_current_week":
+                # Текущая неделя (понедельник - воскресенье)
+                days_since_monday = now.weekday()
+                start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+            elif callback.data == "export_last_week":
+                # Прошлая неделя
+                days_since_monday = now.weekday()
+                week_start = now - timedelta(days=days_since_monday + 7)
+                week_end = now - timedelta(days=days_since_monday + 1)
+                start_date = week_start.strftime("%Y-%m-%d")
+                end_date = week_end.strftime("%Y-%m-%d")
+            elif callback.data == "export_current_year":
+                # Текущий год
+                start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+            elif callback.data == "export_custom":
+                # Произвольный период - запрашиваем даты
+                await callback.message.answer(
+                    "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+                await state.set_state(ExportStates.waiting_for_start_date)
+                return
+            elif callback.data == "export_all":
+                period = None
+                start_date = None
+                end_date = None
+            
+            # Выполняем экспорт
+            await callback.message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
+            csv_blob = await self.supabase.export_expenses_csv(
+                callback.from_user.id, 
+                period=period,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            # Формируем имя файла и описание периода
+            if period:
+                filename = f"expensecat_export_{period}.csv"
+                # Форматируем период для отображения
+                try:
+                    date_obj = datetime.strptime(period, "%Y-%m")
+                    months = ["январь", "февраль", "март", "апрель", "май", "июнь",
+                             "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+                    month_name = months[date_obj.month - 1]
+                    period_text = f"{month_name} {date_obj.year}"
+                except:
+                    period_text = period
+            elif start_date and end_date:
+                filename = f"expensecat_export_{start_date}_{end_date}.csv"
+                # Форматируем даты для отображения
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
+                except:
+                    period_text = f"{start_date} - {end_date}"
+            else:
+                filename = "expensecat_export_all.csv"
+                period_text = "все данные"
+            
+            file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
+            await callback.message.answer_document(
+                document=file,
+                caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
+            )
+            await state.clear()
+        
+        @self.router.message(ExportStates.waiting_for_start_date)
+        async def handle_export_start_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты начала периода для экспорта"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                start_date = date_obj.strftime("%Y-%m-%d")
+                await state.update_data(start_date=start_date)
+                await message.answer(
+                    "📅 Введите дату окончания периода в формате ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
+                await state.set_state(ExportStates.waiting_for_end_date)
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+        
+        @self.router.message(ExportStates.waiting_for_end_date)
+        async def handle_export_end_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты окончания периода для экспорта"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                end_date = date_obj.strftime("%Y-%m-%d")
+                data = await state.get_data()
+                start_date = data.get("start_date")
+                
+                if not start_date:
+                    await message.answer("❌ Ошибка: не найдена дата начала. Начните заново с /export")
+                    await state.clear()
+                    return
+
+                # Проверяем, что дата окончания не раньше даты начала
+                if end_date < start_date:
+                    await message.answer("❌ Дата окончания не может быть раньше даты начала. Введите корректную дату:")
+                    return
+
+                # Выполняем экспорт
+                await message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
+                csv_blob = await self.supabase.export_expenses_csv(
+                    message.from_user.id,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                filename = f"expensecat_export_{start_date}_{end_date}.csv"
+                # Форматируем даты для отображения
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
+                except:
+                    period_text = f"{start_date} - {end_date}"
+                
+                file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
+                await message.answer_document(
+                    document=file,
+                    caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
+                )
+                await state.clear()
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
         
         @self.router.message(ReportStates.waiting_for_start_date)
         async def handle_report_start_date(message: Message, state: FSMContext) -> None:
@@ -1718,7 +1951,7 @@ class ExpenseCatBot:
             logging.info(f"Command /delete_expense received from user {message.from_user.id if message.from_user else 'unknown'}")
             try:
                 if not self.supabase or not message.from_user:
-                    await message.answer("❌ Удаление трат доступно только при подключенной базе данных.")
+                    await message.answer("❌ Удаление расходов доступно только при подключенной базе данных.")
                     return
                 
                 await state.clear()
@@ -1729,11 +1962,11 @@ class ExpenseCatBot:
                 logging.info(f"Found {len(expenses) if expenses else 0} expenses")
                 
                 if not expenses:
-                    await message.answer("📭 У вас нет сохраненных трат за последние 3 месяца.")
+                    await message.answer("📭 У вас нет сохраненных расходов за последние 3 месяца.")
                     return
                 
-                # Формируем сообщение со списком трат
-                text_lines = [f"🗑️ Выберите трату для удаления:\n(показаны последние 3 месяца, {len(expenses)} записей)\n"]
+                # Формируем сообщение со списком расходов
+                text_lines = [f"🗑️ Выберите расход для удаления:\n(показаны последние 3 месяца, {len(expenses)} записей)\n"]
                 keyboard_buttons = []
                 
                 for expense in expenses:  # Показываем все полученные записи
@@ -1840,7 +2073,7 @@ class ExpenseCatBot:
                 logging.info(f"Sent expenses list with {len(keyboard_buttons)} buttons")
             except Exception as exc:
                 logging.exception(f"Error in handle_delete_expense: {exc}")
-                await message.answer(f"❌ Ошибка при получении списка трат: {str(exc)[:200]}")
+                await message.answer(f"❌ Ошибка при получении списка расходов: {str(exc)[:200]}")
 
         @self.router.message(Command("expense"))
         async def handle_expense_entry(message: Message, state: FSMContext) -> None:
@@ -2041,20 +2274,20 @@ class ExpenseCatBot:
                 await callback.message.answer("❌ Ошибка: база данных не подключена.")
                 return
             
-            # Извлекаем ID траты из callback_data
+            # Извлекаем ID расхода из callback_data
             expense_id_str = callback.data.replace("delete_expense_", "")
             try:
                 expense_id = int(expense_id_str)
             except ValueError:
-                await callback.message.answer("❌ Ошибка: неверный ID траты.")
+                await callback.message.answer("❌ Ошибка: неверный ID расхода.")
                 return
             
-            # Получаем информацию о трате для подтверждения (без ограничения по периоду для поиска)
+            # Получаем информацию о расходе для подтверждения (без ограничения по периоду для поиска)
             expenses = await self.supabase.fetch_expenses_list(callback.from_user.id, limit=1000, months_back=0)
             expense = next((e for e in expenses if e.get("id") == expense_id), None)
             
             if not expense:
-                await callback.message.answer("❌ Трата не найдена.")
+                await callback.message.answer("❌ Расход не найден.")
                 await state.clear()
                 return
             
@@ -2092,7 +2325,7 @@ class ExpenseCatBot:
             
             category_text = f"\n📂 Категория: {category}" if category else ""
             await callback.message.answer(
-                f"⚠️ Вы уверены, что хотите удалить трату?\n\n"
+                f"⚠️ Вы уверены, что хотите удалить расход?\n\n"
                 f"{source_icon} Источник: {source_name}\n"
                 f"🏪 Место: {store}\n"
                 f"💰 Сумма: {amount:.2f} {currency}\n"
@@ -2131,20 +2364,20 @@ class ExpenseCatBot:
                     elif source == "bank":
                         source_text = "\n🏦 Банковская транзакция также удалена."
                     
-                    await callback.message.answer(f"✅ Трата успешно удалена.{source_text}")
+                    await callback.message.answer(f"✅ Расход успешно удален.{source_text}")
                 else:
-                    await callback.message.answer("❌ Не удалось удалить трату. Возможно, она уже была удалена.")
+                    await callback.message.answer("❌ Не удалось удалить расход. Возможно, он уже был удален.")
             except Exception as exc:
-                logging.exception(f"Ошибка при удалении траты: {exc}")
+                logging.exception(f"Ошибка при удалении расхода: {exc}")
                 await callback.message.answer(f"⚠️ Ошибка при удалении: {str(exc)[:200]}")
             finally:
                 await state.clear()
 
         @self.router.callback_query(F.data == "cancel_delete_expense")
         async def handle_cancel_delete_expense(callback: CallbackQuery, state: FSMContext) -> None:
-            """Обработчик отмены удаления траты"""
+            """Обработчик отмены удаления расхода"""
             await callback.answer()
-            await callback.message.answer("❌ Удаление траты отменено.")
+            await callback.message.answer("❌ Удаление расхода отменено.")
             await state.clear()
 
         @self.router.callback_query(F.data.startswith("setup_currency_"))
@@ -2191,11 +2424,19 @@ class ExpenseCatBot:
                 else:
                     # Первый запуск
                     await callback.message.answer(
-                        f"✅ Валюта по умолчанию установлена: {symbol} {currency}\n\n"
-                        "Теперь вы можете использовать бота:\n"
+                        f"✅ Готово! Валюта по умолчанию: {symbol} {currency}\n\n"
+                        "✨ Теперь вы можете:\n"
+                        "📸 Отправлять фото чеков — распознаю автоматически\n"
+                        "📝 Добавлять расходы вручную текстом\n"
+                        "🏦 Импортировать банковские выписки\n"
+                        "📊 Получать отчёты по категориям и магазинам\n"
+                        "💰 Поддерживаю несколько валют\n"
+                        "📤 Экспортировать данные в CSV\n\n"
+                        "📋 Основные команды:\n"
                         "/expense — добавить расход вручную\n"
-                        "/report — получить краткий отчёт\n"
-                        "/statement — импортировать выписку"
+                        "/report — получить отчёт\n"
+                        "/statement — импортировать выписку\n"
+                        "/settings — изменить настройки"
                     )
             else:
                 await callback.message.answer("❌ Ошибка при сохранении настроек. Попробуйте еще раз.")
@@ -3073,7 +3314,7 @@ def format_report(report: Dict[str, Any]) -> str:
         lines.append("💰 Всего расходов: 0.00")
         lines.append("")
     
-    # Самая дорогая покупка и трата
+    # Самая дорогая покупка и самый дорогой расход
     most_expensive_item = report.get("most_expensive_item")
     most_expensive_expense = report.get("most_expensive_expense")
     
@@ -3122,7 +3363,7 @@ def format_report(report: Dict[str, Any]) -> str:
                 date_str = exp_date[:10] if len(exp_date) >= 10 else exp_date
         
         store_name = exp_store[:30] if len(exp_store) > 30 else exp_store
-        lines.append("💸 Самая дорогая трата:")
+        lines.append("💸 Самый дорогой расход:")
         if date_str:
             lines.append(f"  {exp_amount:.2f} {exp_symbol} - {store_name} ({date_str})")
         else:
