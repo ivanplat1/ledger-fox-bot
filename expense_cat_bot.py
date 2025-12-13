@@ -133,6 +133,11 @@ class ExportStates(StatesGroup):
     waiting_for_end_date = State()
 
 
+class FeedbackStates(StatesGroup):
+    waiting_for_feedback_type = State()
+    waiting_for_feedback_text = State()
+
+
 class DeleteExpenseStates(StatesGroup):
     waiting_for_confirmation = State()
 
@@ -571,6 +576,7 @@ class SupabaseGateway:
         bank_table: str = "bank_transactions",
         expenses_table: str = "expenses",
         settings_table: str = "user_settings",
+        feedback_table: str = "feedback",
     ) -> None:
         if not SUPABASE_AVAILABLE or create_client is None:
             raise RuntimeError("Supabase client is not installed. Run `pip install supabase`.")
@@ -579,6 +585,7 @@ class SupabaseGateway:
         self.bank_table = bank_table
         self.expenses_table = expenses_table
         self.settings_table = settings_table
+        self.feedback_table = feedback_table
 
     async def check_receipt_exists(self, receipt_hash: str) -> bool:
         """Проверяет, существует ли чек с данным хешем."""
@@ -1271,6 +1278,35 @@ class SupabaseGateway:
     async def delete_expense(self, user_id: int, expense_id: int) -> bool:
         """Асинхронная обертка для удаления расхода"""
         return await asyncio.to_thread(self._delete_expense_sync, user_id, expense_id)
+    
+    async def save_feedback(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        feedback_type: str,
+        feedback_text: str
+    ) -> Dict[str, Any]:
+        """Сохраняет отзыв в базу данных"""
+        payload = {
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "feedback_type": feedback_type,
+            "feedback_text": feedback_text,
+        }
+        return await asyncio.to_thread(
+            self._table_insert,
+            self.feedback_table,
+            payload,
+        )
+    
+    def _table_insert(self, table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Вставляет новую запись в таблицу"""
+        result = self._client.table(table).insert(payload).execute()
+        if not result.data:
+            raise RuntimeError(f"Failed to insert into {table}")
+        return result.data[0]
 
     def _get_user_settings_sync(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Получает настройки пользователя"""
@@ -1371,15 +1407,83 @@ def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
 class ExpenseCatBot:
     """Telegram bot orchestrating OCR, bank parsing, and Supabase storage."""
 
-    def __init__(self, token: str, supabase_gateway: Optional[SupabaseGateway] = None) -> None:
+    def __init__(
+        self, 
+        token: str, 
+        supabase_gateway: Optional[SupabaseGateway] = None,
+        feedback_chat_id: Optional[str] = None
+    ) -> None:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.router = Router(name="expensecat")
         self.supabase = supabase_gateway
+        self.feedback_chat_id = feedback_chat_id  # ID канала/чата для отзывов
         self._media_group_cache: Dict[str, List[Message]] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         self.dp.include_router(self.router)
         self._register_handlers()
+    
+    async def _send_feedback_to_channel(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        feedback_type: str,
+        type_name: str,
+        emoji: str,
+        feedback_text: str
+    ) -> None:
+        """Отправляет отзыв в канал обратной связи"""
+        # Формируем сообщение
+        user_info = f"ID: {user_id}"
+        if username:
+            user_info += f" (@{username})"
+        if first_name:
+            user_info += f" - {first_name}"
+        
+        message_text = (
+            f"{emoji} <b>Новый отзыв: {type_name}</b>\n\n"
+            f"👤 Пользователь: {user_info}\n"
+            f"📝 Тип: {type_name}\n\n"
+            f"💬 Сообщение:\n{feedback_text}"
+        )
+        
+        # Отправляем в канал
+        try:
+            # Пробуем разные форматы ID
+            chat_id = self.feedback_chat_id
+            
+            # Если это числовой ID, пробуем как int
+            if chat_id.startswith("-") or chat_id.isdigit():
+                try:
+                    chat_id_int = int(chat_id)
+                    await self.bot.send_message(
+                        chat_id=chat_id_int,
+                        text=message_text,
+                        parse_mode="HTML"
+                    )
+                    logging.info(f"✅ Feedback sent to channel {chat_id_int}")
+                    return
+                except Exception as int_exc:
+                    logging.warning(f"Failed to send as int {chat_id_int}: {int_exc}")
+            
+            # Пробуем как строку (для username каналов типа @channel_name)
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode="HTML"
+            )
+            logging.info(f"✅ Feedback sent to channel {chat_id}")
+        except Exception as exc:
+            # Если канал не найден, логируем подробную ошибку
+            error_msg = str(exc)
+            logging.error(
+                f"❌ Failed to send feedback to channel {self.feedback_chat_id}: {error_msg}\n"
+                f"   Проверьте:\n"
+                f"   1. Бот добавлен в канал как администратор?\n"
+                f"   2. ID канала правильный? (для приватных каналов нужен ID вида -100...)\n"
+                f"   3. Для публичных каналов можно использовать @channel_name"
+            )
 
     def _create_currency_keyboard(self) -> InlineKeyboardMarkup:
         """Создает клавиатуру для выбора валюты"""
@@ -1403,6 +1507,7 @@ class ExpenseCatBot:
         token = os.getenv("EXPENSECAT_BOT_TOKEN")
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        feedback_chat_id = os.getenv("FEEDBACK_CHAT_ID")  # ID канала/чата для отзывов
         if not token:
             raise RuntimeError("EXPENSECAT_BOT_TOKEN is required to run ExpenseCatBot.")
         gateway = None
@@ -1412,7 +1517,9 @@ class ExpenseCatBot:
             logging.warning(
                 "Supabase credentials not found. Persistence features are disabled until configured."
             )
-        return cls(token=token, supabase_gateway=gateway)
+        if feedback_chat_id:
+            logging.info(f"Feedback channel configured: {feedback_chat_id}")
+        return cls(token=token, supabase_gateway=gateway, feedback_chat_id=feedback_chat_id)
 
     async def run(self) -> None:
         logging.info("Starting ExpenseCatBot")
@@ -1426,6 +1533,7 @@ class ExpenseCatBot:
             BotCommand(command="delete_expense", description="Удалить расход"),
             BotCommand(command="delete_all", description="Удалить все данные"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
+            BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
         ]
         await self.bot.set_my_commands(commands)
         logging.info("Bot commands menu configured")
@@ -1604,6 +1712,134 @@ class ExpenseCatBot:
                 reply_markup=keyboard
             )
 
+        @self.router.message(Command("feedback"))
+        async def handle_feedback(message: Message, state: FSMContext) -> None:
+            """Обработчик команды для обратной связи"""
+            await state.set_state(FeedbackStates.waiting_for_feedback_type)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🐛 Сообщить об ошибке", callback_data="feedback_bug"),
+                ],
+                [
+                    InlineKeyboardButton(text="💡 Предложить функцию", callback_data="feedback_suggestion"),
+                    InlineKeyboardButton(text="😞 Пожаловаться", callback_data="feedback_complaint"),
+                ],
+            ])
+            
+            await message.answer(
+                "📢 Выберите тип обратной связи:",
+                reply_markup=keyboard
+            )
+        
+        @self.router.callback_query(F.data.startswith("feedback_"))
+        async def handle_feedback_type(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик выбора типа обратной связи"""
+            await callback.answer()
+            
+            feedback_type = callback.data.replace("feedback_", "")
+            type_names = {
+                "bug": "ошибка",
+                "suggestion": "предложение",
+                "complaint": "жалоба"
+            }
+            type_emojis = {
+                "bug": "🐛",
+                "suggestion": "💡",
+                "complaint": "😞"
+            }
+            type_instructions = {
+                "bug": "Опишите ошибку подробно. Что вы делали, когда это произошло? Что должно было произойти и что произошло на самом деле?",
+                "suggestion": "Опишите вашу идею подробно. Какую функцию вы хотели бы видеть в боте?",
+                "complaint": "Опишите проблему, с которой вы столкнулись. Что вас не устраивает?"
+            }
+            
+            type_name = type_names.get(feedback_type, feedback_type)
+            emoji = type_emojis.get(feedback_type, "📝")
+            instruction = type_instructions.get(feedback_type, "Опишите проблему подробно.")
+            
+            await state.update_data(feedback_type=feedback_type)
+            await state.set_state(FeedbackStates.waiting_for_feedback_text)
+            
+            await callback.message.answer(
+                f"{emoji} Вы выбрали: {type_name}\n\n{instruction}"
+            )
+        
+        @self.router.message(FeedbackStates.waiting_for_feedback_text)
+        async def handle_feedback_text(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода текста обратной связи"""
+            if not message.text or message.text.startswith("/"):
+                await message.answer(
+                    "❌ Пожалуйста, отправьте текстовое сообщение. "
+                    "Используйте /cancel для отмены."
+                )
+                return
+            
+            feedback_text = message.text.strip()
+            data = await state.get_data()
+            feedback_type = data.get("feedback_type", "unknown")
+            
+            user_id = message.from_user.id if message.from_user else None
+            username = message.from_user.username if message.from_user else "unknown"
+            first_name = message.from_user.first_name if message.from_user else "unknown"
+            
+            type_names = {
+                "bug": "ошибка",
+                "suggestion": "предложение",
+                "complaint": "жалоба"
+            }
+            type_emojis = {
+                "bug": "🐛",
+                "suggestion": "💡",
+                "complaint": "😞"
+            }
+            
+            type_name = type_names.get(feedback_type, feedback_type)
+            emoji = type_emojis.get(feedback_type, "📝")
+            
+            # Логируем обратную связь
+            logging.info(
+                f"Feedback [{feedback_type}] from user_id={user_id} "
+                f"(@{username}, {first_name}): {feedback_text}"
+            )
+            
+            # Сохраняем в базу данных, если Supabase подключен
+            if self.supabase:
+                try:
+                    await self.supabase.save_feedback(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        feedback_text=feedback_text
+                    )
+                except Exception as exc:
+                    logging.exception(f"Ошибка при сохранении отзыва в базу данных: {exc}")
+            
+            # Отправляем в канал обратной связи, если настроен
+            if self.feedback_chat_id:
+                try:
+                    await self._send_feedback_to_channel(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        type_name=type_name,
+                        emoji=emoji,
+                        feedback_text=feedback_text
+                    )
+                except Exception as exc:
+                    logging.exception(f"Ошибка при отправке отзыва в канал: {exc}")
+            
+            await message.answer(
+                f"✅ Спасибо за вашу обратную связь!\n\n"
+                f"{emoji} Тип: {type_name}\n"
+                f"📝 Ваше сообщение:\n{feedback_text}\n\n"
+                "Мы обязательно рассмотрим ваше сообщение и учтём его при улучшении бота."
+            )
+            
+            await state.clear()
+        
         @self.router.message(Command("import"))
         async def handle_import(message: Message, state: FSMContext) -> None:
             await state.clear()
