@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -577,6 +578,7 @@ class SupabaseGateway:
         expenses_table: str = "expenses",
         settings_table: str = "user_settings",
         feedback_table: str = "feedback",
+        limits_table: str = "user_limits",
     ) -> None:
         if not SUPABASE_AVAILABLE or create_client is None:
             raise RuntimeError("Supabase client is not installed. Run `pip install supabase`.")
@@ -586,6 +588,7 @@ class SupabaseGateway:
         self.expenses_table = expenses_table
         self.settings_table = settings_table
         self.feedback_table = feedback_table
+        self.limits_table = limits_table
 
     async def check_receipt_exists(self, receipt_hash: str) -> bool:
         """Проверяет, существует ли чек с данным хешем."""
@@ -1386,6 +1389,133 @@ class SupabaseGateway:
     async def check_user_has_data(self, user_id: int) -> bool:
         """Асинхронная обертка для проверки наличия данных у пользователя"""
         return await asyncio.to_thread(self._check_user_has_data_sync, user_id)
+    
+    def _get_or_create_user_limits_sync(self, user_id: int) -> Dict[str, Any]:
+        """Получает или создает запись лимитов для пользователя"""
+        try:
+            result = (
+                self._client.table(self.limits_table)
+                .select("*")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            
+            # Создаем новую запись с дефолтными значениями
+            default_limits = {
+                "user_id": user_id,
+                "receipts_count": 0,
+                "limit_receipts": 10,  # Пробный период: 10 чеков, Premium: 100 чеков/месяц
+                "subscription_type": "trial",
+                "expires_at": None,
+            }
+            insert_result = (
+                self._client.table(self.limits_table)
+                .insert(default_limits)
+                .execute()
+            )
+            if insert_result.data and len(insert_result.data) > 0:
+                return insert_result.data[0]
+            return default_limits
+        except Exception as exc:
+            logging.exception(f"Error getting/creating user limits for user={user_id}: {exc}")
+            # Возвращаем дефолтные значения при ошибке
+            return {
+                "user_id": user_id,
+                "receipts_count": 0,
+                "limit_receipts": 10,
+                "subscription_type": "trial",
+                "expires_at": None,
+            }
+    
+    async def get_or_create_user_limits(self, user_id: int) -> Dict[str, Any]:
+        """Асинхронная обертка для получения/создания лимитов пользователя"""
+        return await asyncio.to_thread(self._get_or_create_user_limits_sync, user_id)
+    
+    def _check_receipt_limit_sync(self, user_id: int) -> tuple[bool, Dict[str, Any]]:
+        """Проверяет, не превышен ли лимит чеков для пользователя"""
+        limits = self._get_or_create_user_limits_sync(user_id)
+        receipts_count = limits.get("receipts_count", 0)
+        limit_receipts = limits.get("limit_receipts", 10)
+        subscription_type = limits.get("subscription_type", "trial")
+        
+        # Проверяем подписку
+        if subscription_type == "unlimited":
+            return True, limits
+        
+        # Проверяем срок действия подписки
+        expires_at = limits.get("expires_at")
+        if expires_at:
+            from datetime import datetime
+            try:
+                if isinstance(expires_at, str):
+                    expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                else:
+                    expires_dt = expires_at
+                if expires_dt < datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                    # Подписка истекла, возвращаемся к пробному периоду
+                    subscription_type = "trial"
+                    limit_receipts = 10
+                    # Обновляем лимит в базе
+                    self._client.table(self.limits_table).update({
+                        "subscription_type": "trial",
+                        "limit_receipts": 10
+                    }).eq("user_id", user_id).execute()
+            except:
+                pass
+        
+        # Устанавливаем лимит в зависимости от типа подписки
+        # Пробный период: 10 чеков
+        # Premium подписка: 100 чеков в месяц (стоимость ~$0.0175 за чек, ~$1.75 за 100 чеков)
+        if subscription_type == "premium":
+            if limit_receipts != 100:
+                limit_receipts = 100
+                # Обновляем лимит в базе
+                try:
+                    self._client.table(self.limits_table).update({
+                        "limit_receipts": 100
+                    }).eq("user_id", user_id).execute()
+                except:
+                    pass
+        elif subscription_type == "trial":
+            if limit_receipts != 10:
+                limit_receipts = 10
+                # Обновляем лимит в базе
+                try:
+                    self._client.table(self.limits_table).update({
+                        "limit_receipts": 10
+                    }).eq("user_id", user_id).execute()
+                except:
+                    pass
+        
+        # Проверяем лимит
+        if receipts_count >= limit_receipts:
+            return False, limits
+        
+        return True, limits
+    
+    async def check_receipt_limit(self, user_id: int) -> tuple[bool, Dict[str, Any]]:
+        """Асинхронная обертка для проверки лимита чеков"""
+        return await asyncio.to_thread(self._check_receipt_limit_sync, user_id)
+    
+    def _increment_receipt_count_sync(self, user_id: int) -> None:
+        """Увеличивает счетчик чеков пользователя"""
+        try:
+            # Получаем текущее значение и увеличиваем
+            limits = self._get_or_create_user_limits_sync(user_id)
+            current_count = limits.get("receipts_count", 0)
+            self._client.table(self.limits_table).update({
+                "receipts_count": current_count + 1
+            }).eq("user_id", user_id).execute()
+            logging.info(f"Incremented receipt count for user={user_id}: {current_count} -> {current_count + 1}")
+        except Exception as exc:
+            logging.exception(f"Error incrementing receipt count for user={user_id}: {exc}")
+    
+    async def increment_receipt_count(self, user_id: int) -> None:
+        """Асинхронная обертка для увеличения счетчика чеков"""
+        await asyncio.to_thread(self._increment_receipt_count_sync, user_id)
 
 
 def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
@@ -1404,6 +1534,121 @@ def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
     return truncated + "\n\n... (сообщение обрезано, слишком длинное)"
 
 
+class RateLimitMiddleware:
+    """Middleware для защиты от DDoS и злоупотреблений через rate limiting."""
+    
+    def __init__(
+        self,
+        max_requests_per_minute: int = 15,
+        max_requests_per_hour: int = 50,
+        max_file_requests_per_minute: int = 10,
+    ):
+        self.max_requests_per_minute = max_requests_per_minute
+        self.max_requests_per_hour = max_requests_per_hour
+        self.max_file_requests_per_minute = max_file_requests_per_minute
+        
+        # Хранилище запросов: user_id -> список временных меток
+        self._requests_per_user: Dict[int, List[datetime]] = defaultdict(list)
+        self._file_requests_per_user: Dict[int, List[datetime]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+    
+    async def __call__(self, handler, event, data):
+        """Проверяет rate limit перед обработкой события."""
+        if not hasattr(event, 'from_user') or not event.from_user:
+            return await handler(event, data)
+        
+        user_id = event.from_user.id
+        now = datetime.utcnow()
+        
+        async with self._lock:
+            # Очищаем старые записи (старше часа)
+            self._cleanup_old_requests(user_id, now)
+            
+            # Проверяем лимит на файлы (фото, документы)
+            is_file_request = (
+                hasattr(event, 'photo') and event.photo or
+                hasattr(event, 'document') and event.document
+            )
+            
+            if is_file_request:
+                # Более строгий лимит для файлов
+                file_requests = self._file_requests_per_user[user_id]
+                recent_file_requests = [
+                    req_time for req_time in file_requests
+                    if (now - req_time).total_seconds() < 60
+                ]
+                
+                if len(recent_file_requests) >= self.max_file_requests_per_minute:
+                    logging.warning(
+                        f"Rate limit exceeded for file requests: user_id={user_id}, "
+                        f"requests={len(recent_file_requests)}/{self.max_file_requests_per_minute}"
+                    )
+                    if hasattr(event, 'answer'):
+                        await event.answer(
+                            "⚠️ Слишком много запросов. Пожалуйста, подождите немного."
+                        )
+                    return
+            
+                file_requests.append(now)
+                self._file_requests_per_user[user_id] = recent_file_requests + [now]
+            
+            # Проверяем общий лимит запросов в минуту
+            requests = self._requests_per_user[user_id]
+            recent_requests = [
+                req_time for req_time in requests
+                if (now - req_time).total_seconds() < 60
+            ]
+            
+            if len(recent_requests) >= self.max_requests_per_minute:
+                logging.warning(
+                    f"Rate limit exceeded per minute: user_id={user_id}, "
+                    f"requests={len(recent_requests)}/{self.max_requests_per_minute}"
+                )
+                if hasattr(event, 'answer'):
+                    await event.answer(
+                        "⚠️ Слишком много запросов в минуту. Пожалуйста, подождите."
+                    )
+                return
+            
+            # Проверяем лимит запросов в час
+            hourly_requests = [
+                req_time for req_time in requests
+                if (now - req_time).total_seconds() < 3600
+            ]
+            
+            if len(hourly_requests) >= self.max_requests_per_hour:
+                logging.warning(
+                    f"Rate limit exceeded per hour: user_id={user_id}, "
+                    f"requests={len(hourly_requests)}/{self.max_requests_per_hour}"
+                )
+                if hasattr(event, 'answer'):
+                    await event.answer(
+                        "⚠️ Превышен лимит запросов в час. Пожалуйста, попробуйте позже."
+                    )
+                return
+            
+            requests.append(now)
+            self._requests_per_user[user_id] = hourly_requests + [now]
+        
+        return await handler(event, data)
+    
+    def _cleanup_old_requests(self, user_id: int, now: datetime) -> None:
+        """Удаляет старые записи (старше часа) для экономии памяти."""
+        # Очищаем общие запросы
+        requests = self._requests_per_user[user_id]
+        self._requests_per_user[user_id] = [
+            req_time for req_time in requests
+            if (now - req_time).total_seconds() < 3600
+        ]
+        
+        # Очищаем запросы файлов
+        file_requests = self._file_requests_per_user[user_id]
+        self._file_requests_per_user[user_id] = [
+            req_time for req_time in file_requests
+            if (now - req_time).total_seconds() < 3600
+        ]
+
+
 class ExpenseCatBot:
     """Telegram bot orchestrating OCR, bank parsing, and Supabase storage."""
 
@@ -1420,6 +1665,17 @@ class ExpenseCatBot:
         self.feedback_chat_id = feedback_chat_id  # ID канала/чата для отзывов
         self._media_group_cache: Dict[str, List[Message]] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
+        
+        # Добавляем rate limiting middleware для защиты от DDoS
+        rate_limit_middleware = RateLimitMiddleware(
+            max_requests_per_minute=15,
+            max_requests_per_hour=50,
+            max_file_requests_per_minute=10,
+        )
+        self.router.message.middleware(rate_limit_middleware)
+        self.router.callback_query.middleware(rate_limit_middleware)
+        logging.info("Rate limiting middleware enabled for DDoS protection")
+        
         self.dp.include_router(self.router)
         self._register_handlers()
     
@@ -1530,10 +1786,10 @@ class ExpenseCatBot:
             BotCommand(command="report", description="Получить отчёт"),
             BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
+            BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
+            BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
             BotCommand(command="delete_expense", description="Удалить расход"),
             BotCommand(command="delete_all", description="Удалить все данные"),
-            BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
-            BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
         ]
         await self.bot.set_my_commands(commands)
         logging.info("Bot commands menu configured")
@@ -2421,6 +2677,30 @@ class ExpenseCatBot:
                 await state.clear()
                 return
             
+            if not callback.from_user:
+                await callback.message.answer("Ошибка: не удалось определить пользователя.")
+                await state.clear()
+                return
+            
+            # Проверяем лимит чеков перед сохранением
+            if self.supabase:
+                can_save, limits = await self.supabase.check_receipt_limit(callback.from_user.id)
+                if not can_save:
+                    receipts_count = limits.get("receipts_count", 0)
+                    limit_receipts = limits.get("limit_receipts", 10)
+                    await callback.message.answer(
+                        f"⚠️ Достигнут лимит пробного периода\n\n"
+                        f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
+                        f"Для продолжения распознавания чеков необходимо оформить подписку.\n"
+                        f"Свяжитесь с администратором для получения доступа.\n\n"
+                        f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
+                        f"• 📊 Получение отчетов (/report)\n"
+                        f"• 📥 Выгрузка данных в CSV (/export)\n"
+                        f"• ✏️ Добавление расходов вручную (/expense)"
+                    )
+                    await state.clear()
+                    return
+            
             try:
                 # Сохраняем чек в базу
                 stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
@@ -2680,6 +2960,24 @@ class ExpenseCatBot:
             await state.clear()
 
     async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
+        # Проверяем лимит чеков перед обработкой
+        if self.supabase and message.from_user:
+            can_save, limits = await self.supabase.check_receipt_limit(message.from_user.id)
+            if not can_save:
+                receipts_count = limits.get("receipts_count", 0)
+                limit_receipts = limits.get("limit_receipts", 10)
+                await message.answer(
+                    f"⚠️ Достигнут лимит пробного периода\n\n"
+                    f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
+                    f"Для продолжения распознавания чеков необходимо оформить подписку.\n"
+                    f"Свяжитесь с администратором для получения доступа.\n\n"
+                    f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
+                    f"• 📊 Получение отчетов (/report)\n"
+                    f"• 📥 Выгрузка данных в CSV (/export)\n"
+                    f"• ✏️ Добавление расходов вручную (/expense)"
+                )
+                return
+        
         await message.answer("Чек принят, распознаю…")
         result = await self._handle_receipt_from_message(message)
         logging.info(f"Receipt processing result: success={result.success}, has_summary={bool(result.summary)}, has_error={bool(result.error)}")
@@ -2828,6 +3126,11 @@ class ExpenseCatBot:
             else:
                 logging.info("Starting OpenAI receipt parsing...")
                 response_json = await parse_receipt_with_ai(file_bytes, mime_type)
+            
+            # Увеличиваем счетчик чеков после успешного запроса в OpenAI
+            # (независимо от того, дубликат это или нет, так как запрос в OpenAI уже оплачен)
+            if self.supabase and message.from_user:
+                await self.supabase.increment_receipt_count(message.from_user.id)
             
             # Извлекаем только content из message и информацию о токенах
             try:
@@ -6514,29 +6817,70 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
             
             # Цена и количество в следующем элементе
             price_elem = item_elem.select_one('.ready_ticket__item')
-            price_text = price_elem.get_text(strip=True) if price_elem else ""
+            if not price_elem:
+                continue
             
-            # Извлекаем количество и цену за единицу (формат: "3.000 X 649.00" или "=1947.00")
-            qty_price_match = re.search(r'(\d+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
-            if qty_price_match:
-                quantity = float(qty_price_match.group(1))
-                unit_price = float(qty_price_match.group(2))
-                total_price = quantity * unit_price
-            else:
-                # Пытаемся найти итоговую цену (формат: "=1947.00")
-                total_price_match = re.search(r'[=]\s*(\d+\.?\d*)', price_text)
-                if total_price_match:
-                    total_price = float(total_price_match.group(1))
+            # Получаем весь текст элемента, включая пробелы
+            price_text = price_elem.get_text(separator=' ', strip=False)
+            # Убираем лишние пробелы, но сохраняем структуру
+            price_text = ' '.join(price_text.split())
+            
+            logging.debug(f"Parsing price text: '{price_text}'")
+            
+            # Ищем итоговую цену после знака "=" (формат: "= 13 299.00" или "=13299.00")
+            total_price_match = re.search(r'=\s*([\d\s]+\.?\d*)', price_text)
+            if total_price_match:
+                total_price_str = total_price_match.group(1).replace(' ', '')
+                total_price = float(total_price_str)
+                
+                # Ищем количество и цену за единицу (формат: "13 299.00 x 1" или "13299.00 x 1")
+                # Ищем паттерн: число с пробелами, затем x, затем число
+                qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
+                if qty_price_match:
+                    unit_price_str = qty_price_match.group(1).replace(' ', '')
+                    quantity_str = qty_price_match.group(2)
+                    unit_price = float(unit_price_str)
+                    quantity = float(quantity_str)
+                    # Проверяем, что total_price соответствует unit_price * quantity
+                    expected_total = unit_price * quantity
+                    if abs(total_price - expected_total) > 0.01:
+                        # Используем вычисленное значение, если оно отличается
+                        total_price = expected_total
+                else:
+                    # Если не нашли количество, предполагаем quantity = 1
                     quantity = 1.0
                     unit_price = total_price
+            else:
+                # Пытаемся найти паттерн "цена x количество" без знака "="
+                qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
+                if qty_price_match:
+                    unit_price_str = qty_price_match.group(1).replace(' ', '')
+                    quantity_str = qty_price_match.group(2)
+                    unit_price = float(unit_price_str)
+                    quantity = float(quantity_str)
+                    total_price = unit_price * quantity
                 else:
-                    # Просто ищем число
-                    price_match = re.search(r'(\d+\.?\d*)', price_text.replace(' ', ''))
-                    if price_match:
-                        total_price = float(price_match.group(1))
+                    # Ищем просто большое число (цена с пробелами)
+                    # Ищем числа вида "13 299.00" или "13299.00"
+                    numbers = re.findall(r'[\d\s]+\.?\d*', price_text)
+                    # Фильтруем маленькие числа (меньше 100, вероятно это не цена)
+                    valid_prices = []
+                    for num_str in numbers:
+                        num_clean = num_str.replace(' ', '')
+                        try:
+                            num_val = float(num_clean)
+                            if num_val >= 100:  # Минимальная цена товара обычно >= 100
+                                valid_prices.append((num_val, num_str))
+                        except:
+                            continue
+                    
+                    if valid_prices:
+                        # Берем самое большое число как итоговую цену
+                        total_price, _ = max(valid_prices, key=lambda x: x[0])
                         quantity = 1.0
                         unit_price = total_price
                     else:
+                        logging.warning(f"Could not parse price from text: '{price_text}'")
                         continue
             
             items.append({
