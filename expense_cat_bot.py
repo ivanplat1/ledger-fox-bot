@@ -193,6 +193,7 @@ class ProcessingResult:
     error: Optional[str] = None
     parsed_receipt: Optional[ParsedReceipt] = None
     receipt_payload: Optional[Dict[str, Any]] = None
+    qr_url_found_but_failed: Optional[str] = None  # URL QR-кода, если он был найден, но данные не получены
 
 
 @dataclass
@@ -363,8 +364,8 @@ class ReceiptParserAI:
             # Если QR-кода нет, используем изображение
             if not mime_type.startswith("image/"):
                 raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-            data_url = build_data_url(file_bytes, mime_type)
-            payload = self._build_payload(data_url)
+        data_url = build_data_url(file_bytes, mime_type)
+        payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -931,56 +932,56 @@ class SupabaseGateway:
         currencies_data = {}
         for currency, currency_data in data_by_currency.items():
             total = sum(entry.get("amount", 0.0) for entry in currency_data)
-            
-            # Разбивка по категориям товаров из items чеков
-            categories = {}
-            expenses_without_receipt = []
-            
-            for entry in currency_data:
-                receipt_id = entry.get("receipt_id")
-                if receipt_id and receipt_id in receipts_data:
-                    # Берем категории из items чека
-                    items = receipts_data[receipt_id]
-                    if items and isinstance(items, list) and len(items) > 0:
-                        # Есть items - суммируем по категориям товаров
-                        for item in items:
-                            if isinstance(item, dict):
-                                item_category = item.get("category")
-                                item_price = float(item.get("price", 0.0))
-                                if item_category:
-                                    categories[item_category] = categories.get(item_category, 0.0) + item_price
-                                else:
-                                    # Если категории нет, используем "Другое"
-                                    categories["Другое"] = categories.get("Другое", 0.0) + item_price
-                    else:
-                        # Нет items в чеке - используем категорию из expense или "Другое"
-                        expenses_without_receipt.append(entry)
+        
+        # Разбивка по категориям товаров из items чеков
+        categories = {}
+        expenses_without_receipt = []
+        
+        for entry in currency_data:
+            receipt_id = entry.get("receipt_id")
+            if receipt_id and receipt_id in receipts_data:
+                # Берем категории из items чека
+                items = receipts_data[receipt_id]
+                if items and isinstance(items, list) and len(items) > 0:
+                    # Есть items - суммируем по категориям товаров
+                    for item in items:
+                        if isinstance(item, dict):
+                            item_category = item.get("category")
+                            item_price = float(item.get("price", 0.0))
+                            if item_category:
+                                categories[item_category] = categories.get(item_category, 0.0) + item_price
+                            else:
+                                # Если категории нет, используем "Другое"
+                                categories["Другое"] = categories.get("Другое", 0.0) + item_price
                 else:
-                    # Нет чека - используем категорию из expense или "Другое"
+                    # Нет items в чеке - используем категорию из expense или "Другое"
                     expenses_without_receipt.append(entry)
-            
-            # Обрабатываем расходы без чеков или без items
-            for entry in expenses_without_receipt:
-                category = entry.get("category") or "Другое"
+            else:
+                # Нет чека - используем категорию из expense или "Другое"
+                expenses_without_receipt.append(entry)
+        
+        # Обрабатываем расходы без чеков или без items
+        for entry in expenses_without_receipt:
+            category = entry.get("category") or "Другое"
+            amount = entry.get("amount", 0.0)
+            categories[category] = categories.get(category, 0.0) + amount
+        
+        # Разбивка по магазинам
+        stores = {}
+        for entry in currency_data:
+            store = entry.get("store") or "Без названия"
+            amount = entry.get("amount", 0.0)
+            stores[store] = stores.get(store, 0.0) + amount
+        
+        # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
+        daily = {}
+        for entry in currency_data:
+            date_str = entry.get("date", "")
+            if date_str:
+                day = date_str[:10]  # YYYY-MM-DD
                 amount = entry.get("amount", 0.0)
-                categories[category] = categories.get(category, 0.0) + amount
-            
-            # Разбивка по магазинам
-            stores = {}
-            for entry in currency_data:
-                store = entry.get("store") or "Без названия"
-                amount = entry.get("amount", 0.0)
-                stores[store] = stores.get(store, 0.0) + amount
-            
-            # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
-            daily = {}
-            for entry in currency_data:
-                date_str = entry.get("date", "")
-                if date_str:
-                    day = date_str[:10]  # YYYY-MM-DD
-                    amount = entry.get("amount", 0.0)
-                    daily[day] = daily.get(day, 0.0) + amount
-            
+                daily[day] = daily.get(day, 0.0) + amount
+        
             currencies_data[currency] = {
                 "total": total,
                 "by_category": categories,
@@ -1516,6 +1517,150 @@ class SupabaseGateway:
     async def increment_receipt_count(self, user_id: int) -> None:
         """Асинхронная обертка для увеличения счетчика чеков"""
         await asyncio.to_thread(self._increment_receipt_count_sync, user_id)
+    
+    def _save_rejected_receipt_photo_sync(
+        self, 
+        user_id: int, 
+        file_bytes: bytes, 
+        reason: str,
+        mime_type: str = "image/jpeg"
+    ) -> Optional[str]:
+        """
+        Сохраняет фото отклоненного чека в Supabase Storage.
+        Использует service_role ключ для авторизации (передается при создании SupabaseGateway).
+        """
+        """
+        Сохраняет фото отклоненного/невалидного чека в Supabase Storage.
+        Возвращает путь к файлу или None при ошибке.
+        """
+        try:
+            from datetime import datetime
+            import hashlib
+            
+            # Создаем уникальное имя файла: user_id_timestamp_hash.ext
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            file_hash = hashlib.md5(file_bytes).hexdigest()[:8]
+            
+            # Определяем расширение файла
+            ext_map = {
+                "image/jpeg": "jpg",
+                "image/jpg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+                "image/heic": "heic",
+                "image/heif": "heif",
+            }
+            ext = ext_map.get(mime_type.lower(), "jpg")
+            
+            # Путь в Storage: rejected_receipts/user_id/YYYYMMDD_HHMMSS_hash.ext
+            file_path = f"rejected_receipts/{user_id}/{timestamp}_{file_hash}.{ext}"
+            
+            # Пытаемся загрузить файл
+            try:
+                # Пробуем разные варианты bucket (приоритет: rejected-receipts)
+                # Пытаемся загрузить напрямую, так как list_buckets() может не работать из-за прав доступа
+                bucket_candidates = ["rejected-receipts", "rejected_receipts", "receipts"]
+                bucket_name = None
+                upload_error = None
+                
+                # Пробуем загрузить в каждый bucket по очереди
+                for candidate in bucket_candidates:
+                    try:
+                        storage_api = self._client.storage.from_(candidate)
+                        result = storage_api.upload(
+                            path=file_path,
+                            file=file_bytes,
+                            file_options={
+                                "content-type": mime_type,
+                                "upsert": False  # Не перезаписывать существующие файлы
+                            }
+                        )
+                        bucket_name = candidate
+                        logging.info(f"✅ Successfully uploaded to bucket: {bucket_name}")
+                        break
+                    except Exception as upload_exc:
+                        upload_error = upload_exc
+                        error_msg = str(upload_exc)
+                        # Логируем детали ошибки для диагностики
+                        if hasattr(upload_exc, 'message'):
+                            error_msg = upload_exc.message
+                        elif isinstance(upload_exc, dict):
+                            error_msg = str(upload_exc)
+                        logging.warning(f"Failed to upload to bucket '{candidate}': {error_msg}")
+                        continue
+                
+                if not bucket_name:
+                    # Если не удалось загрузить ни в один bucket, пробуем получить список для диагностики
+                    try:
+                        buckets_response = self._client.storage.list_buckets()
+                        bucket_names = []
+                        if buckets_response:
+                            if isinstance(buckets_response, list):
+                                buckets_list = buckets_response
+                            elif hasattr(buckets_response, 'data'):
+                                buckets_list = buckets_response.data or []
+                            elif hasattr(buckets_response, '__iter__'):
+                                buckets_list = list(buckets_response)
+                            else:
+                                buckets_list = []
+                            
+                            for b in buckets_list:
+                                if isinstance(b, str):
+                                    bucket_names.append(b)
+                                elif hasattr(b, 'name'):
+                                    bucket_names.append(b.name)
+                                elif isinstance(b, dict):
+                                    bucket_names.append(b.get('name', ''))
+                                elif hasattr(b, 'id'):
+                                    bucket_names.append(str(b.id))
+                        logging.warning(
+                            f"Failed to upload to any bucket. Available buckets: {bucket_names}. "
+                            f"Last error: {upload_error}. Please create 'rejected-receipts' bucket manually."
+                        )
+                    except Exception as list_exc:
+                        logging.warning(
+                            f"Failed to upload to any bucket and cannot list buckets. "
+                            f"Last upload error: {upload_error}. List error: {list_exc}. "
+                            f"Please create 'rejected-receipts' bucket manually in Supabase Dashboard."
+                        )
+                    return None
+                
+                # Сохраняем метаданные в отдельную таблицу (опционально)
+                # Можно добавить таблицу rejected_receipts для отслеживания
+                
+                logging.info(
+                    f"Saved rejected receipt photo: user_id={user_id}, "
+                    f"reason={reason}, path={file_path}, size={len(file_bytes)} bytes"
+                )
+                
+                return file_path
+                
+            except Exception as storage_exc:
+                logging.exception(f"Error uploading to storage: {storage_exc}")
+                return None
+                
+        except Exception as exc:
+            logging.exception(f"Error saving rejected receipt photo for user={user_id}: {exc}")
+            return None
+    
+    async def save_rejected_receipt_photo(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        reason: str,
+        mime_type: str = "image/jpeg"
+    ) -> Optional[str]:
+        """
+        Асинхронная обертка для сохранения фото отклоненного чека.
+        reason: 'rejected_by_user' или 'validation_error'
+        """
+        return await asyncio.to_thread(
+            self._save_rejected_receipt_photo_sync,
+            user_id,
+            file_bytes,
+            reason,
+            mime_type
+        )
 
 
 def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
@@ -1656,13 +1801,15 @@ class ExpenseCatBot:
         self, 
         token: str, 
         supabase_gateway: Optional[SupabaseGateway] = None,
-        feedback_chat_id: Optional[str] = None
+        feedback_chat_id: Optional[str] = None,
+        failed_receipts_chat_id: Optional[str] = None
     ) -> None:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.router = Router(name="expensecat")
         self.supabase = supabase_gateway
         self.feedback_chat_id = feedback_chat_id  # ID канала/чата для отзывов
+        self.failed_receipts_chat_id = failed_receipts_chat_id  # ID канала для фейлов чеков
         self._media_group_cache: Dict[str, List[Message]] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         
@@ -1740,6 +1887,118 @@ class ExpenseCatBot:
                 f"   2. ID канала правильный? (для приватных каналов нужен ID вида -100...)\n"
                 f"   3. Для публичных каналов можно использовать @channel_name"
             )
+    
+    async def _send_failed_receipt_to_channel(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        reason: str,
+        file_path: Optional[str] = None,
+        file_bytes: Optional[bytes] = None,
+        mime_type: Optional[str] = None,
+        error_message: Optional[str] = None
+    ) -> None:
+        """Отправляет информацию о фейле чека в канал с фото"""
+        if not self.failed_receipts_chat_id:
+            return
+        
+        # Формируем сообщение
+        user_info = f"ID: {user_id}"
+        if username:
+            user_info += f" (@{username})"
+        if first_name:
+            user_info += f" - {first_name}"
+        
+        reason_names = {
+            "rejected_by_user": "Отклонен пользователем",
+            "validation_error": "Ошибка валидации"
+        }
+        reason_name = reason_names.get(reason, reason)
+        
+        emoji = "❌" if reason == "rejected_by_user" else "⚠️"
+        
+        caption = (
+            f"{emoji} <b>Фейл чека: {reason_name}</b>\n\n"
+            f"👤 Пользователь: {user_info}\n"
+            f"📋 Причина: {reason_name}\n"
+        )
+        
+        if file_path:
+            caption += f"📁 Файл: <code>{file_path}</code>\n"
+        
+        if error_message:
+            caption += f"\n💬 Ошибка:\n<code>{error_message[:500]}</code>"
+        
+        # Отправляем в канал
+        try:
+            chat_id = self.failed_receipts_chat_id
+            
+            # Определяем chat_id как int или str
+            chat_id_int = None
+            if chat_id.startswith("-") or chat_id.isdigit():
+                try:
+                    chat_id_int = int(chat_id)
+                except ValueError:
+                    pass
+            
+            # Если есть фото, отправляем его с подписью
+            if file_bytes:
+                # Определяем расширение файла из mime_type
+                ext_map = {
+                    "image/jpeg": "jpg",
+                    "image/jpg": "jpg",
+                    "image/png": "png",
+                    "image/webp": "webp",
+                    "image/heic": "heic",
+                    "image/heif": "heif",
+                }
+                ext = ext_map.get(mime_type or "image/jpeg", "jpg")
+                filename = f"rejected_receipt_{user_id}_{reason}.{ext}"
+                
+                photo = BufferedInputFile(file_bytes, filename=filename)
+                
+                if chat_id_int is not None:
+                    await self.bot.send_photo(
+                        chat_id=chat_id_int,
+                        photo=photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                    logging.info(f"✅ Failed receipt photo sent to channel {chat_id_int}")
+                else:
+                    await self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                    logging.info(f"✅ Failed receipt photo sent to channel {chat_id}")
+            else:
+                # Если фото нет, отправляем только текст
+                if chat_id_int is not None:
+                    await self.bot.send_message(
+                        chat_id=chat_id_int,
+                        text=caption,
+                        parse_mode="HTML"
+                    )
+                    logging.info(f"✅ Failed receipt info sent to channel {chat_id_int}")
+                else:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=caption,
+                        parse_mode="HTML"
+                    )
+                    logging.info(f"✅ Failed receipt info sent to channel {chat_id}")
+        except Exception as exc:
+            error_msg = str(exc)
+            logging.error(
+                f"❌ Failed to send failed receipt info to channel {self.failed_receipts_chat_id}: {error_msg}\n"
+                f"   Проверьте:\n"
+                f"   1. Бот добавлен в канал как администратор?\n"
+                f"   2. ID канала правильный? (для приватных каналов нужен ID вида -100...)\n"
+                f"   3. Для публичных каналов можно использовать @channel_name"
+            )
 
     def _create_currency_keyboard(self) -> InlineKeyboardMarkup:
         """Создает клавиатуру для выбора валюты"""
@@ -1764,6 +2023,7 @@ class ExpenseCatBot:
         supabase_url = os.getenv("SUPABASE_URL")
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         feedback_chat_id = os.getenv("FEEDBACK_CHAT_ID")  # ID канала/чата для отзывов
+        failed_receipts_chat_id = os.getenv("FAILED_RECEIPTS_CHAT_ID")  # ID канала для фейлов чеков
         if not token:
             raise RuntimeError("EXPENSECAT_BOT_TOKEN is required to run ExpenseCatBot.")
         gateway = None
@@ -1775,7 +2035,14 @@ class ExpenseCatBot:
             )
         if feedback_chat_id:
             logging.info(f"Feedback channel configured: {feedback_chat_id}")
-        return cls(token=token, supabase_gateway=gateway, feedback_chat_id=feedback_chat_id)
+        if failed_receipts_chat_id:
+            logging.info(f"Failed receipts channel configured: {failed_receipts_chat_id}")
+        return cls(
+            token=token, 
+            supabase_gateway=gateway, 
+            feedback_chat_id=feedback_chat_id,
+            failed_receipts_chat_id=failed_receipts_chat_id
+        )
 
     async def run(self) -> None:
         logging.info("Starting ExpenseCatBot")
@@ -2095,7 +2362,7 @@ class ExpenseCatBot:
             )
             
             await state.clear()
-        
+
         @self.router.message(Command("import"))
         async def handle_import(message: Message, state: FSMContext) -> None:
             await state.clear()
@@ -2139,7 +2406,7 @@ class ExpenseCatBot:
             
             if not self.supabase:
                 await callback.message.answer("Отчёты по расходам появятся после подключения базы (Supabase).")
-                return
+            return
             
             now = datetime.utcnow()
             period = None
@@ -2698,10 +2965,55 @@ class ExpenseCatBot:
                         f"• 📥 Выгрузка данных в CSV (/export)\n"
                         f"• ✏️ Добавление расходов вручную (/expense)"
                     )
-                    await state.clear()
-                    return
+                await state.clear()
+                return
             
             try:
+                # Проверяем несоответствие суммы перед сохранением
+                if parsed_receipt:
+                    items_sum = sum(item.price for item in parsed_receipt.items)
+                    total = parsed_receipt.total or 0.0
+                    difference = abs(items_sum - total)
+                    tolerance = max(total * 0.01, 1.0)
+                    
+                    if difference > tolerance:
+                        # Несоответствие суммы - не сохраняем, отправляем фото в rejected receipts
+                        file_bytes = data.get("receipt_photo_bytes")
+                        mime_type = data.get("receipt_photo_mime_type", "image/jpeg")
+                        
+                        if file_bytes and self.supabase:
+                            try:
+                                file_path = await self.supabase.save_rejected_receipt_photo(
+                                    user_id=callback.from_user.id,
+                                    file_bytes=file_bytes,
+                                    reason="validation_error",
+                                    mime_type=mime_type
+                                )
+                                # Отправляем информацию о фейле в канал
+                                if file_path and self.failed_receipts_chat_id:
+                                    await self._send_failed_receipt_to_channel(
+                                        user_id=callback.from_user.id,
+                                        username=callback.from_user.username,
+                                        first_name=callback.from_user.first_name,
+                                        reason="validation_error",
+                                        file_path=file_path,
+                                        file_bytes=file_bytes,  # Отправляем фото напрямую
+                                        mime_type=mime_type,
+                                        error_message=f"Несоответствие суммы: позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}"
+                                    )
+                            except Exception as exc:
+                                logging.warning(f"Failed to save rejected receipt photo: {exc}")
+                        
+                        await callback.message.answer(
+                            f"❌ Чек не сохранен из-за несоответствия суммы:\n"
+                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                            f"Итого: {total:.2f} {parsed_receipt.currency}\n"
+                            f"Разница: {difference:.2f} {parsed_receipt.currency}\n\n"
+                            f"Пожалуйста, отправьте фото чека заново."
+                        )
+                        await state.clear()
+                        return
+                
                 # Сохраняем чек в базу
                 stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
                 
@@ -2731,7 +3043,38 @@ class ExpenseCatBot:
         async def handle_receipt_reject(callback: CallbackQuery, state: FSMContext) -> None:
             """Обработчик отклонения чека"""
             await callback.answer()
-            await callback.message.answer("Понял, отправьте фото чека заново для переснятия.")
+            
+            # Сохраняем фото в Storage для дальнейшего изучения
+            if self.supabase and callback.from_user:
+                data = await state.get_data()
+                file_bytes = data.get("receipt_photo_bytes")
+                mime_type = data.get("receipt_photo_mime_type", "image/jpeg")
+                
+                if file_bytes:
+                    try:
+                        file_path = await self.supabase.save_rejected_receipt_photo(
+                            user_id=callback.from_user.id,
+                            file_bytes=file_bytes,
+                            reason="rejected_by_user",
+                            mime_type=mime_type
+                        )
+                        if file_path:
+                            logging.info(f"Saved rejected receipt photo: {file_path}")
+                            # Отправляем информацию о фейле в канал
+                            if self.failed_receipts_chat_id:
+                                await self._send_failed_receipt_to_channel(
+                                    user_id=callback.from_user.id,
+                                    username=callback.from_user.username,
+                                    first_name=callback.from_user.first_name,
+                                    reason="rejected_by_user",
+                                    file_path=file_path,
+                                    file_bytes=file_bytes,  # Отправляем фото напрямую
+                                    mime_type=mime_type
+                                )
+                    except Exception as exc:
+                        logging.warning(f"Failed to save rejected receipt photo: {exc}")
+            
+            await callback.message.answer("Понял, отправьте фото чека заново.")
             await state.clear()
 
         @self.router.callback_query(F.data == "delete_confirm")
@@ -2979,14 +3322,119 @@ class ExpenseCatBot:
                 return
         
         await message.answer("Чек принят, распознаю…")
+        
+        # Сохраняем оригинальное фото для возможного сохранения при отклонении
+        file = await self._resolve_file(message)
+        file_bytes_for_storage = None
+        mime_type_for_storage = None
+        if file:
+            mime_type_for_storage = detect_mime_type(message, file.file_path)
+            file_bytes_for_storage = await self._download_file(file.file_path)
+            try:
+                file_bytes_for_storage, mime_type_for_storage = convert_heic_if_needed(
+                    file_bytes_for_storage, mime_type_for_storage
+                )
+            except:
+                pass
+        
         result = await self._handle_receipt_from_message(message)
         logging.info(f"Receipt processing result: success={result.success}, has_summary={bool(result.summary)}, has_error={bool(result.error)}")
+        
+        # Если была ошибка валидации, сохраняем фото
+        if not result.success and result.error and file_bytes_for_storage and self.supabase and message.from_user:
+            try:
+                file_path = await self.supabase.save_rejected_receipt_photo(
+                    user_id=message.from_user.id,
+                    file_bytes=file_bytes_for_storage,
+                    reason="validation_error",
+                    mime_type=mime_type_for_storage or "image/jpeg"
+                )
+                # Отправляем информацию о фейле в канал
+                if file_path and self.failed_receipts_chat_id:
+                    await self._send_failed_receipt_to_channel(
+                        user_id=message.from_user.id,
+                        username=message.from_user.username,
+                        first_name=message.from_user.first_name,
+                        reason="validation_error",
+                        file_path=file_path,
+                        file_bytes=file_bytes_for_storage,  # Отправляем фото напрямую
+                        mime_type=mime_type_for_storage or "image/jpeg",
+                        error_message=result.error
+                    )
+            except Exception as exc:
+                logging.warning(f"Failed to save rejected receipt photo: {exc}")
+        
         if result.success and result.summary:
-            # Сохраняем данные чека в FSM для подтверждения
+            # Проверяем валидацию суммы перед сохранением данных в FSM
+            validation_passed = True
+            if result.parsed_receipt:
+                items_sum = sum(item.price for item in result.parsed_receipt.items)
+                total = result.parsed_receipt.total or 0.0
+                difference = abs(items_sum - total)
+                tolerance = max(total * 0.01, 1.0)
+                validation_passed = difference <= tolerance
+            
+            if not validation_passed:
+                # Если валидация не пройдена, сохраняем фото и отправляем уведомление в канал
+                if file_bytes_for_storage and self.supabase and message.from_user:
+                    try:
+                        file_path = await self.supabase.save_rejected_receipt_photo(
+                            user_id=message.from_user.id,
+                            file_bytes=file_bytes_for_storage,
+                            reason="validation_error",
+                            mime_type=mime_type_for_storage or "image/jpeg"
+                        )
+                        # Отправляем информацию о фейле в канал
+                        if file_path:
+                            logging.info(f"Rejected receipt photo saved: {file_path}")
+                            if self.failed_receipts_chat_id:
+                                items_sum = sum(item.price for item in result.parsed_receipt.items)
+                                total = result.parsed_receipt.total or 0.0
+                                difference = abs(items_sum - total)
+                                error_text = f"Несоответствие суммы: позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}"
+                                if result.qr_url_found_but_failed:
+                                    error_text += " | Не удалось получить данные по QR-коду"
+                                logging.info(f"Sending failed receipt notification to channel: {self.failed_receipts_chat_id}")
+                                await self._send_failed_receipt_to_channel(
+                                    user_id=message.from_user.id,
+                                    username=message.from_user.username,
+                                    first_name=message.from_user.first_name,
+                                    reason="validation_error",
+                                    file_path=file_path,
+                                    file_bytes=file_bytes_for_storage,  # Отправляем фото напрямую
+                                    mime_type=mime_type_for_storage or "image/jpeg",
+                                    error_message=error_text
+                                )
+                            else:
+                                logging.warning("failed_receipts_chat_id not configured, skipping channel notification")
+                        else:
+                            logging.warning("file_path is None, cannot send notification to channel")
+                    except Exception as exc:
+                        logging.exception(f"Failed to save rejected receipt photo or send notification: {exc}")
+                
+                # Формируем сообщение об ошибке
+                error_message = "❌ Не удалось корректно распознать чек.\n\n"
+                
+                # Добавляем информацию о QR-коде, если он был найден, но данные не получены
+                if result.qr_url_found_but_failed:
+                    error_message += (
+                        f"⚠️ Не удалось получить данные по QR-коду.\n"
+                        f"Пожалуйста, отправьте полное фото чека со всеми позициями."
+                    )
+                else:
+                    error_message += "Пожалуйста, отправьте фото чека заново."
+                
+                await message.answer(error_message)
+                await state.clear()  # Очищаем состояние FSM
+                return
+            
+            # Сохраняем данные чека в FSM для подтверждения (только если валидация пройдена)
             if result.parsed_receipt and result.receipt_payload:
                 await state.update_data(
                     parsed_receipt=result.parsed_receipt,
                     receipt_payload=result.receipt_payload,
+                    receipt_photo_bytes=file_bytes_for_storage,  # Сохраняем фото для возможного отклонения
+                    receipt_photo_mime_type=mime_type_for_storage or "image/jpeg",
                 )
                 await state.set_state(ReceiptStates.waiting_for_confirmation)
             
@@ -3000,7 +3448,7 @@ class ExpenseCatBot:
                 ]
             ])
             
-            # Пытаемся сгенерировать изображение
+            # Генерируем и отправляем изображение (валидация уже пройдена)
             if result.parsed_receipt:
                 img_bytes = generate_receipt_image(result.parsed_receipt)
                 if img_bytes:
@@ -3011,22 +3459,11 @@ class ExpenseCatBot:
                     # Отправляем результат валидации отдельным сообщением
                     items_sum = sum(item.price for item in result.parsed_receipt.items)
                     total = result.parsed_receipt.total or 0.0
-                    difference = abs(items_sum - total)
-                    tolerance = max(total * 0.01, 1.0)
-                    
-                    if difference > tolerance:
-                        validation_text = (
-                            f"⚠️ Несоответствие суммы:\n"
-                            f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
-                            f"Итого: {total:.2f} {result.parsed_receipt.currency}\n"
-                            f"Разница: {difference:.2f} {result.parsed_receipt.currency}"
-                        )
-                    else:
-                        validation_text = (
-                            f"✅ Валидация пройдена:\n"
-                            f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
-                            f"Итого: {total:.2f} {result.parsed_receipt.currency}"
-                        )
+                    validation_text = (
+                        f"✅ Валидация пройдена:\n"
+                        f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
+                        f"Итого: {total:.2f} {result.parsed_receipt.currency}"
+                    )
                     await message.answer(validation_text)
                     
                     # Добавляем дополнительную информацию текстом, если есть
@@ -3075,6 +3512,7 @@ class ExpenseCatBot:
         
         # Переменная для хранения данных из QR-кода для отправки в OpenAI
         qr_data_from_url = None
+        qr_url_found_but_failed = None  # URL QR-кода, если он был найден, но данные не получены
         
         # Если есть QR-код или штрих-код с URL, пытаемся получить данные оттуда
         if qr_codes:
@@ -3100,6 +3538,8 @@ class ExpenseCatBot:
                     else:
                         logging.warning(f"⚠️ Не удалось получить данные с URL, используем изображение")
                         qr_data_from_url = None  # Сброс, чтобы использовать изображение
+                        # Сохраняем информацию о том, что QR был найден, но данные не получены
+                        qr_url_found_but_failed = qr_data
                     # Если найден QR-код с URL, игнорируем все остальные коды
                     break
                 else:
@@ -3191,8 +3631,11 @@ class ExpenseCatBot:
                 # Допускаем погрешность до 1% или 1 единицу валюты (что больше)
                 tolerance = max(total * 0.01, 1.0)
                 
+                # Проверяем валидацию суммы
+                validation_passed = difference <= tolerance
+                
                 validation_message = ""
-                if difference > tolerance:
+                if not validation_passed:
                     validation_message = (
                         f"\n\n⚠️ Несоответствие суммы:\n"
                         f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
@@ -3211,8 +3654,17 @@ class ExpenseCatBot:
                     )
                     logging.info(f"✅ Сумма позиций совпадает с итого: {items_sum:.2f} = {total:.2f}")
                 
-                # Форматируем чек в виде таблицы
-                receipt_table = format_receipt_table(parsed_receipt)
+                # Форматируем чек в виде таблицы только если валидация пройдена
+                receipt_table = ""
+                if validation_passed:
+                    receipt_table = format_receipt_table(parsed_receipt)
+                else:
+                    # Если валидация не пройдена, показываем только основную информацию без деталей товаров
+                    receipt_table = (
+                        f"🏪 Магазин: {parsed_receipt.store}\n"
+                        f"💰 Итого: {total:.2f} {parsed_receipt.currency}\n"
+                        f"📅 Дата: {parsed_receipt.purchased_at.strftime('%d.%m.%Y %H:%M') if parsed_receipt.purchased_at else 'Не указана'}"
+                    )
                 
                 # Извлекаем информацию о токенах
                 usage = response_json.get("usage", {})
@@ -3226,6 +3678,14 @@ class ExpenseCatBot:
                 
                 # Формируем итоговый ответ
                 summary = receipt_table + validation_message
+                
+                # Добавляем уведомление, если QR-код был найден, но данные не получены
+                if qr_url_found_but_failed:
+                    qr_notification = (
+                        f"\n\n⚠️ Найден QR-код, но не удалось получить данные по URL.\n"
+                        f"Пожалуйста, перефотографируйте чек целиком (не только QR-код)."
+                    )
+                    summary += qr_notification
                 
                 # Добавляем информацию о QR-кодах, если они были найдены
                 if qr_codes:
@@ -3258,6 +3718,7 @@ class ExpenseCatBot:
                     summary=summary,
                     parsed_receipt=parsed_receipt,
                     receipt_payload=receipt_payload,
+                    qr_url_found_but_failed=qr_url_found_but_failed,
                 )
             except Exception as exc:
                 logging.error(f"Error extracting content: {exc}", exc_info=True)
@@ -3319,6 +3780,7 @@ class ExpenseCatBot:
                                         summary=response_str,
                                         parsed_receipt=parsed_receipt,
                                         receipt_payload=receipt_payload,
+                                        qr_url_found_but_failed=qr_url_found_but_failed,
                                     )
                                 except Exception as fallback_exc:
                                     logging.exception(f"Ошибка при парсинге в fallback: {fallback_exc}")
@@ -3335,6 +3797,7 @@ class ExpenseCatBot:
                 return ProcessingResult(
                     success=True,
                     summary=response_str,
+                    qr_url_found_but_failed=qr_url_found_but_failed,
                 )
         except ReceiptParsingError as exc:
             logging.exception("Receipt parsing failed")
@@ -3851,7 +4314,7 @@ def format_report(report: Dict[str, Any]) -> str:
     else:
         # Нет данных
         lines.append("💰 Всего расходов: 0.00")
-        lines.append("")
+    lines.append("")
     
     # Самая дорогая покупка и самый дорогой расход
     most_expensive_item = report.get("most_expensive_item")
@@ -3921,28 +4384,28 @@ def format_report(report: Dict[str, Any]) -> str:
         if len(currencies_data) > 1:
             lines.append(f"━━━ {symbol} ━━━")
             lines.append(f"💰 Итого: {total:.2f} {symbol}")
-            lines.append("")
-        
-        # Разбивка по категориям
-        if by_category:
-            lines.append("📂 По категориям:")
-            sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
-            for category, amount in sorted_categories[:10]:  # Топ 10
-                percentage = (amount / total * 100) if total > 0 else 0
-                lines.append(f"  • {category}: {amount:.2f} {symbol} ({percentage:.1f}%)")
-            lines.append("")
-        
-        # Топ магазинов
-        if by_store:
-            lines.append("🏪 Топ магазинов:")
-            sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
-            for store, amount in sorted_stores[:5]:  # Топ 5
-                percentage = (amount / total * 100) if total > 0 else 0
-                # Нормализуем название магазина для отображения
-                store_name = normalize_store_name(store)
-                store_name = store_name[:40] if len(store_name) > 40 else store_name
-                lines.append(f"  • {store_name}: {amount:.2f} {symbol} ({percentage:.1f}%)")
-            lines.append("")
+        lines.append("")
+    
+    # Разбивка по категориям
+    if by_category:
+        lines.append("📂 По категориям:")
+        sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
+        for category, amount in sorted_categories[:10]:  # Топ 10
+            percentage = (amount / total * 100) if total > 0 else 0
+            lines.append(f"  • {category}: {amount:.2f} {symbol} ({percentage:.1f}%)")
+        lines.append("")
+    
+    # Топ магазинов
+    if by_store:
+        lines.append("🏪 Топ магазинов:")
+        sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
+        for store, amount in sorted_stores[:5]:  # Топ 5
+            percentage = (amount / total * 100) if total > 0 else 0
+            # Нормализуем название магазина для отображения
+            store_name = normalize_store_name(store)
+            store_name = store_name[:40] if len(store_name) > 40 else store_name
+            lines.append(f"  • {store_name}: {amount:.2f} {symbol} ({percentage:.1f}%)")
+        lines.append("")
     
     return "\n".join(lines)
 
@@ -6850,16 +7313,6 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
                     # Если не нашли количество, предполагаем quantity = 1
                     quantity = 1.0
                     unit_price = total_price
-            else:
-                # Пытаемся найти паттерн "цена x количество" без знака "="
-                qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
-                if qty_price_match:
-                    unit_price_str = qty_price_match.group(1).replace(' ', '')
-                    quantity_str = qty_price_match.group(2)
-                    unit_price = float(unit_price_str)
-                    quantity = float(quantity_str)
-                    total_price = unit_price * quantity
-                else:
                     # Ищем просто большое число (цена с пробелами)
                     # Ищем числа вида "13 299.00" или "13299.00"
                     numbers = re.findall(r'[\d\s]+\.?\d*', price_text)

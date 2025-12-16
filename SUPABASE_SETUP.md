@@ -33,6 +33,21 @@
 - `expenses` - для хранения трат/расходов
 - `bank_transactions` - для хранения банковских транзакций
 
+## Шаг 2.5: Настройка Storage buckets
+
+1. Откройте SQL Editor в Supabase Dashboard
+2. Скопируйте содержимое файла `setup_storage_buckets.sql`
+3. Выполните SQL скрипт
+
+Это создаст:
+- `rejected-receipts` bucket - для хранения фото отклоненных/невалидных чеков
+- `receipts` bucket - для хранения фото обычных чеков (опционально)
+- Настроит политики доступа для service_role
+
+**Важно:** После выполнения скрипта проверьте, что buckets созданы:
+- Перейдите в Storage в Supabase Dashboard
+- Убедитесь, что видны buckets `rejected-receipts` и `receipts`
+
 ## Шаг 3: Настройка переменных окружения
 
 Добавьте в ваш `.env` файл:
