@@ -2,16 +2,16 @@
 -- Выполните этот SQL в Supabase SQL Editor
 
 -- Таблица лимитов пользователей (для монетизации)
--- Лимиты:
---   - Пробный период (trial): 10 чеков
---   - Premium подписка: 100 чеков в месяц
+-- Тарифы:
+--   - Trial (пробный период): 10 чеков бесплатно
+--   - Pro: 100 чеков в месяц за 200 ⭐
+--   - Premium: безлимит чеков за 500 ⭐
 --   - Стоимость одного запроса в OpenAI: ~$0.0175 (GPT-4o)
---   - Стоимость 100 чеков: ~$1.75
 CREATE TABLE IF NOT EXISTS user_limits (
     user_id BIGINT PRIMARY KEY,
     receipts_count INTEGER NOT NULL DEFAULT 0,
-    limit_receipts INTEGER NOT NULL DEFAULT 10, -- Лимит чеков: 10 для trial, 100 для premium
-    subscription_type TEXT DEFAULT 'trial', -- 'trial', 'premium', 'unlimited'
+    limit_receipts INTEGER, -- Лимит чеков: 10 для trial, 100 для pro, NULL для premium (безлимит)
+    subscription_type TEXT DEFAULT 'trial', -- 'trial', 'pro', 'premium'
     expires_at TIMESTAMPTZ, -- Дата окончания подписки (NULL для пробного периода)
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()

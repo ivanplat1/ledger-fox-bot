@@ -20,7 +20,11 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from aiogram.types import (
+    BufferedInputFile, Message, CallbackQuery, InlineKeyboardMarkup, 
+    InlineKeyboardButton, BotCommand, LabeledPrice, PreCheckoutQuery, 
+    SuccessfulPayment
+)
 from dotenv import load_dotenv
 import requests
 
@@ -275,6 +279,17 @@ def get_paddleocr_instance():
             # Используем многоязычную модель (поддерживает русский, казахский, английский)
             # Пробуем сначала китайскую модель (многоязычную), она более универсальная
             logging.info("Initializing PaddleOCR...")
+            
+            # Проверяем, есть ли ошибка подключения к хостам моделей
+            network_error_keywords = [
+                "No model hoster is available",
+                "network connection",
+                "HuggingFace",
+                "ModelScope",
+                "AIStudio",
+                "BOS"
+            ]
+            
             try:
                 _paddleocr_instance = PaddleOCR(
                     use_angle_cls=True,
@@ -284,6 +299,20 @@ def get_paddleocr_instance():
                 )
                 logging.info("PaddleOCR initialized with Chinese (multilingual) model")
             except Exception as exc_ch:
+                error_msg = str(exc_ch)
+                # Проверяем, является ли это ошибкой подключения к хостам моделей
+                is_network_error = any(keyword in error_msg for keyword in network_error_keywords)
+                
+                if is_network_error:
+                    logging.warning(
+                        f"PaddleOCR cannot connect to model hosts: {error_msg}\n"
+                        f"PaddleOCR will be disabled. Using Tesseract instead.\n"
+                        f"To fix: ensure internet connection or download models manually."
+                    )
+                    # Помечаем PaddleOCR как недоступный для этой сессии
+                    _paddleocr_instance = False  # Используем False вместо None для обозначения ошибки сети
+                    return None
+                
                 logging.warning(f"Failed to initialize PaddleOCR with 'ch' model: {exc_ch}, trying 'ru'...")
                 try:
                     _paddleocr_instance = PaddleOCR(
@@ -294,6 +323,17 @@ def get_paddleocr_instance():
                     )
                     logging.info("PaddleOCR initialized with Russian model")
                 except Exception as exc_ru:
+                    error_msg_ru = str(exc_ru)
+                    is_network_error_ru = any(keyword in error_msg_ru for keyword in network_error_keywords)
+                    
+                    if is_network_error_ru:
+                        logging.warning(
+                            f"PaddleOCR cannot connect to model hosts: {error_msg_ru}\n"
+                            f"PaddleOCR will be disabled. Using Tesseract instead."
+                        )
+                        _paddleocr_instance = False
+                        return None
+                    
                     logging.error(f"Failed to initialize PaddleOCR with 'ru' model: {exc_ru}")
                     # Пробуем без use_angle_cls
                     try:
@@ -305,12 +345,42 @@ def get_paddleocr_instance():
                         )
                         logging.info("PaddleOCR initialized without angle classification")
                     except Exception as exc_no_cls:
+                        error_msg_no_cls = str(exc_no_cls)
+                        is_network_error_no_cls = any(keyword in error_msg_no_cls for keyword in network_error_keywords)
+                        
+                        if is_network_error_no_cls:
+                            logging.warning(
+                                f"PaddleOCR cannot connect to model hosts: {error_msg_no_cls}\n"
+                                f"PaddleOCR will be disabled. Using Tesseract instead."
+                            )
+                            _paddleocr_instance = False
+                            return None
+                        
                         logging.error(f"Failed to initialize PaddleOCR without cls: {exc_no_cls}")
-                        raise exc_no_cls
-            logging.info("PaddleOCR initialized successfully")
+                        # Не пробрасываем исключение, просто возвращаем None
+                        _paddleocr_instance = False
+                        return None
+            
+            if _paddleocr_instance and _paddleocr_instance is not False:
+                logging.info("PaddleOCR initialized successfully")
         except Exception as exc:
-            logging.error(f"Failed to initialize PaddleOCR: {exc}")
+            error_msg = str(exc)
+            is_network_error = any(keyword in error_msg for keyword in network_error_keywords)
+            
+            if is_network_error:
+                logging.warning(
+                    f"PaddleOCR cannot connect to model hosts: {error_msg}\n"
+                    f"PaddleOCR will be disabled. Using Tesseract instead."
+                )
+            else:
+                logging.error(f"Failed to initialize PaddleOCR: {exc}")
+            _paddleocr_instance = False
             return None
+    
+    # Если _paddleocr_instance == False, значит была ошибка сети, возвращаем None
+    if _paddleocr_instance is False:
+        return None
+    
     return _paddleocr_instance
 
 
@@ -1408,7 +1478,7 @@ class SupabaseGateway:
             default_limits = {
                 "user_id": user_id,
                 "receipts_count": 0,
-                "limit_receipts": 10,  # Пробный период: 10 чеков, Premium: 100 чеков/месяц
+                "limit_receipts": 10,  # Trial: 10 чеков, Standard: 50 чеков/месяц, Pro: 100 чеков/месяц, Premium: безлимит
                 "subscription_type": "trial",
                 "expires_at": None,
             }
@@ -1442,11 +1512,36 @@ class SupabaseGateway:
         limit_receipts = limits.get("limit_receipts", 10)
         subscription_type = limits.get("subscription_type", "trial")
         
-        # Проверяем подписку
-        if subscription_type == "unlimited":
-            return True, limits
+        # Проверяем подписку Premium (безлимит)
+        if subscription_type == "premium":
+            # Проверяем срок действия подписки
+            expires_at = limits.get("expires_at")
+            if expires_at:
+                from datetime import datetime
+                try:
+                    if isinstance(expires_at, str):
+                        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    else:
+                        expires_dt = expires_at
+                    if expires_dt < datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                        # Подписка истекла, возвращаемся к пробному периоду
+                        subscription_type = "trial"
+                        limit_receipts = 10
+                        # Обновляем лимит в базе
+                        self._client.table(self.limits_table).update({
+                            "subscription_type": "trial",
+                            "limit_receipts": 10
+                        }).eq("user_id", user_id).execute()
+                    else:
+                        # Premium подписка активна - безлимит
+                        return True, limits
+                except:
+                    pass
+            else:
+                # Premium без expires_at - безлимит
+                return True, limits
         
-        # Проверяем срок действия подписки
+        # Проверяем срок действия подписки для других типов
         expires_at = limits.get("expires_at")
         if expires_at:
             from datetime import datetime
@@ -1468,9 +1563,21 @@ class SupabaseGateway:
                 pass
         
         # Устанавливаем лимит в зависимости от типа подписки
-        # Пробный период: 10 чеков
-        # Premium подписка: 100 чеков в месяц (стоимость ~$0.0175 за чек, ~$1.75 за 100 чеков)
-        if subscription_type == "premium":
+        # Trial: 10 чеков
+        # Standard: 50 чеков в месяц
+        # Pro: 100 чеков в месяц
+        # Premium: безлимит (уже обработано выше)
+        if subscription_type == "standard":
+            if limit_receipts != 50:
+                limit_receipts = 50
+                # Обновляем лимит в базе
+                try:
+                    self._client.table(self.limits_table).update({
+                        "limit_receipts": 50
+                    }).eq("user_id", user_id).execute()
+                except:
+                    pass
+        elif subscription_type == "pro":
             if limit_receipts != 100:
                 limit_receipts = 100
                 # Обновляем лимит в базе
@@ -1517,6 +1624,60 @@ class SupabaseGateway:
     async def increment_receipt_count(self, user_id: int) -> None:
         """Асинхронная обертка для увеличения счетчика чеков"""
         await asyncio.to_thread(self._increment_receipt_count_sync, user_id)
+    
+    def _activate_subscription_sync(self, user_id: int, subscription_type: str, months: int = 1) -> Dict[str, Any]:
+        """Активирует подписку для пользователя (pro или premium)"""
+        from datetime import datetime, timedelta
+        
+        expires_at = datetime.utcnow() + timedelta(days=30 * months)
+        
+        # Определяем лимит в зависимости от типа подписки
+        if subscription_type == "standard":
+            limit_receipts = 50
+        elif subscription_type == "pro":
+            limit_receipts = 100
+        elif subscription_type == "premium":
+            limit_receipts = None  # Безлимит (будет храниться как NULL или большое число)
+        else:
+            raise ValueError(f"Invalid subscription type: {subscription_type}")
+        
+        try:
+            # Обновляем или создаем запись с подпиской
+            update_data = {
+                "user_id": user_id,
+                "subscription_type": subscription_type,
+                "expires_at": expires_at.isoformat() + "Z",
+                "receipts_count": 0,  # Сбрасываем счетчик при активации подписки
+            }
+            
+            if limit_receipts is not None:
+                update_data["limit_receipts"] = limit_receipts
+            
+            result = (
+                self._client.table(self.limits_table)
+                .upsert(update_data)
+                .execute()
+            )
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return {
+                "user_id": user_id,
+                "subscription_type": subscription_type,
+                "limit_receipts": limit_receipts,
+                "expires_at": expires_at.isoformat() + "Z",
+            }
+        except Exception as exc:
+            logging.exception(f"Error activating {subscription_type} subscription for user={user_id}: {exc}")
+            raise
+    
+    async def activate_subscription(self, user_id: int, subscription_type: str, months: int = 1) -> Dict[str, Any]:
+        """Асинхронная обертка для активации подписки"""
+        return await asyncio.to_thread(self._activate_subscription_sync, user_id, subscription_type, months)
+    
+    # Оставляем старый метод для обратной совместимости
+    async def activate_premium_subscription(self, user_id: int, months: int = 1) -> Dict[str, Any]:
+        """Асинхронная обертка для активации Premium подписки (deprecated, используйте activate_subscription)"""
+        return await self.activate_subscription(user_id, "premium", months)
     
     def _save_rejected_receipt_photo_sync(
         self, 
@@ -2053,6 +2214,8 @@ class ExpenseCatBot:
             BotCommand(command="report", description="Получить отчёт"),
             BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
+            BotCommand(command="limits", description="Проверить лимиты и подписку"),
+            BotCommand(command="subscribe", description="Оформить подписку Premium"),
             BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
             BotCommand(command="delete_expense", description="Удалить расход"),
@@ -2118,6 +2281,7 @@ class ExpenseCatBot:
                 "/report — получить отчёт\n"
                 "/statement — импортировать выписку\n"
                 "/export — экспорт в CSV\n"
+                "/subscribe — оформить подписку Premium\n"
                 "/delete_expense — удалить расход\n"
                 "/settings — настройки"
             )
@@ -2126,6 +2290,378 @@ class ExpenseCatBot:
         async def handle_cancel(message: Message, state: FSMContext) -> None:
             await state.clear()
             await message.answer("Ок, отменили.")
+        
+        @self.router.message(Command("limits"))
+        async def handle_limits(message: Message) -> None:
+            """Обработчик команды /limits - показывает информацию о лимитах и подписке"""
+            if not message.from_user:
+                return
+            
+            if not self.supabase:
+                await message.answer("❌ База данных не подключена.")
+                return
+            
+            limits = await self.supabase.get_or_create_user_limits(message.from_user.id)
+            subscription_type = limits.get("subscription_type", "trial")
+            receipts_count = limits.get("receipts_count", 0)
+            limit_receipts = limits.get("limit_receipts", 10)
+            expires_at = limits.get("expires_at")
+            
+            # Определяем название тарифа и эмодзи
+            subscription_info = {
+                "trial": ("Trial", "🆓", "бесплатно"),
+                "standard": ("Standard", "📦", "100 ⭐/мес"),
+                "pro": ("Pro", "⭐", "200 ⭐/мес"),
+                "premium": ("Premium", "👑", "500 ⭐/мес"),
+            }
+            sub_name, sub_emoji, sub_price = subscription_info.get(subscription_type, ("Unknown", "❓", "?"))
+            
+            # Формируем сообщение
+            status_text = f"{sub_emoji} <b>Ваш тариф: {sub_name}</b>\n"
+            if subscription_type != "trial":
+                status_text += f"💰 Стоимость: {sub_price}\n"
+            status_text += "\n"
+            
+            # Информация о лимитах
+            if subscription_type == "premium":
+                status_text += f"📊 <b>Чеков использовано:</b> {receipts_count}\n"
+                status_text += f"♾️ <b>Лимит:</b> Безлимит\n"
+            else:
+                status_text += f"📊 <b>Чеков использовано:</b> {receipts_count}/{limit_receipts}\n"
+                status_text += f"📈 <b>Осталось:</b> {max(0, limit_receipts - receipts_count)} чеков\n"
+            
+            # Информация о сроке действия подписки
+            if expires_at and subscription_type != "trial":
+                try:
+                    if isinstance(expires_at, str):
+                        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    else:
+                        expires_dt = expires_at
+                    now = datetime.utcnow().replace(tzinfo=expires_dt.tzinfo)
+                    
+                    if expires_dt > now:
+                        expires_str = expires_dt.strftime("%d.%m.%Y")
+                        days_left = (expires_dt - now).days
+                        status_text += f"\n📅 <b>Подписка действует до:</b> {expires_str}\n"
+                        if days_left > 0:
+                            status_text += f"⏰ <b>Осталось дней:</b> {days_left}\n"
+                    else:
+                        status_text += f"\n⚠️ <b>Подписка истекла</b>\n"
+                        status_text += f"Используйте /subscribe для продления\n"
+                except Exception as e:
+                    logging.warning(f"Error parsing expires_at: {e}")
+            
+            # Предупреждение о приближении к лимиту
+            if subscription_type != "premium" and receipts_count >= limit_receipts * 0.8:
+                remaining = limit_receipts - receipts_count
+                if remaining <= 0:
+                    status_text += f"\n⚠️ <b>Лимит исчерпан!</b>\n"
+                    status_text += f"Используйте /subscribe для увеличения лимита\n"
+                elif remaining <= 5:
+                    status_text += f"\n⚠️ Осталось мало чеков! Используйте /subscribe\n"
+            
+            await message.answer(status_text, parse_mode="HTML")
+        
+        @self.router.message(Command("subscribe"))
+        async def handle_subscribe(message: Message) -> None:
+            """Обработчик команды /subscribe - показывает биллборд с тарифами"""
+            if not message.from_user:
+                return
+            
+            # Проверяем текущую подписку
+            current_subscription = "trial"
+            expires_at = None
+            if self.supabase:
+                limits = await self.supabase.get_or_create_user_limits(message.from_user.id)
+                current_subscription = limits.get("subscription_type", "trial")
+                expires_at = limits.get("expires_at")
+                
+                # Проверяем, не истекла ли подписка
+                if expires_at and current_subscription in ("pro", "premium"):
+                    try:
+                        if isinstance(expires_at, str):
+                            expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                        else:
+                            expires_dt = expires_at
+                        if expires_dt <= datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                            current_subscription = "trial"
+                    except:
+                        pass
+            
+            # Формируем биллборд с тарифами
+            billboard_text = (
+                "💎 <b>Тарифы ExpenseCatBot</b>\n\n"
+                
+                "🆓 <b>Trial</b> (текущий тариф)\n"
+                "• 10 чеков бесплатно\n"
+                "• Все базовые функции\n"
+                "• Отчеты и экспорт\n\n"
+                
+                "📦 <b>Standard</b> — 100 ⭐/месяц\n"
+                "• 50 чеков в месяц\n"
+                "• Все функции бота\n\n"
+                
+                "⭐ <b>Pro</b> — 200 ⭐/месяц\n"
+                "• 100 чеков в месяц\n"
+                "• Все функции бота\n\n"
+                
+                "👑 <b>Premium</b> — 500 ⭐/месяц\n"
+                "• Безлимит чеков\n"
+                "• Все функции бота\n\n"
+            )
+            
+            # Добавляем информацию о текущей подписке
+            if current_subscription == "trial":
+                billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+            elif current_subscription == "standard" and expires_at:
+                try:
+                    if isinstance(expires_at, str):
+                        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    else:
+                        expires_dt = expires_at
+                    if expires_dt > datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                        expires_str = expires_dt.strftime("%d.%m.%Y")
+                        billboard_text += f"📦 <i>У вас активна Standard подписка до {expires_str}</i>\n\n"
+                    else:
+                        billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+                except:
+                    billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+            elif current_subscription == "pro" and expires_at:
+                try:
+                    if isinstance(expires_at, str):
+                        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    else:
+                        expires_dt = expires_at
+                    if expires_dt > datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                        expires_str = expires_dt.strftime("%d.%m.%Y")
+                        billboard_text += f"⭐ <i>У вас активна Pro подписка до {expires_str}</i>\n\n"
+                    else:
+                        billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+                except:
+                    billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+            elif current_subscription == "premium" and expires_at:
+                try:
+                    if isinstance(expires_at, str):
+                        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                    else:
+                        expires_dt = expires_at
+                    if expires_dt > datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                        expires_str = expires_dt.strftime("%d.%m.%Y")
+                        billboard_text += f"👑 <i>У вас активна Premium подписка до {expires_str}</i>\n\n"
+                    else:
+                        billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+                except:
+                    billboard_text += "📊 <i>Ваш текущий тариф: Trial</i>\n\n"
+            
+            billboard_text += "Выберите тариф для оплаты:"
+            
+            # Создаем кнопки для выбора тарифа (каждая кнопка на отдельной строке)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📦 Standard — 100 ⭐/мес", callback_data="subscribe_standard"),
+                ],
+                [
+                    InlineKeyboardButton(text="⭐ Pro — 200 ⭐/мес", callback_data="subscribe_pro"),
+                ],
+                [
+                    InlineKeyboardButton(text="👑 Premium — 500 ⭐/мес", callback_data="subscribe_premium"),
+                ]
+            ])
+            
+            await message.answer(billboard_text, reply_markup=keyboard, parse_mode="HTML")
+        
+        @self.router.callback_query(F.data.startswith("subscribe_"))
+        async def handle_subscribe_callback(callback: CallbackQuery) -> None:
+            """Обработчик выбора тарифа для подписки"""
+            if not callback.from_user or not callback.data:
+                return
+            
+            subscription_type = callback.data.replace("subscribe_", "")
+            
+            if subscription_type not in ("standard", "pro", "premium"):
+                await callback.answer("Неверный тариф", show_alert=True)
+                return
+            
+            # Проверяем текущую подписку
+            if self.supabase:
+                limits = await self.supabase.get_or_create_user_limits(callback.from_user.id)
+                current_subscription = limits.get("subscription_type", "trial")
+                expires_at = limits.get("expires_at")
+                
+                # Если уже есть активная подписка того же или более высокого уровня
+                subscription_levels = {"trial": 0, "standard": 1, "pro": 2, "premium": 3}
+                current_level = subscription_levels.get(current_subscription, 0)
+                selected_level = subscription_levels.get(subscription_type, 0)
+                
+                if expires_at:
+                    try:
+                        if isinstance(expires_at, str):
+                            expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                        else:
+                            expires_dt = expires_at
+                        if expires_dt > datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                            if current_level >= selected_level:
+                                expires_str = expires_dt.strftime("%d.%m.%Y")
+                                subscription_names = {
+                                    "standard": "Standard",
+                                    "pro": "Pro",
+                                    "premium": "Premium"
+                                }
+                                await callback.answer(
+                                    f"У вас уже активна {subscription_names.get(current_subscription, '')} подписка до {expires_str}",
+                                    show_alert=True
+                                )
+                                return
+                    except:
+                        pass
+            
+            # Определяем параметры подписки
+            if subscription_type == "standard":
+                price_amount = 100
+                title = "Standard подписка ExpenseCatBot"
+                description = (
+                    "Получите Standard подписку и увеличьте лимит до 50 чеков в месяц!\n\n"
+                    "✨ Что входит:\n"
+                    "• 50 чеков в месяц (вместо 10)\n"
+                    "• Все функции бота без ограничений"
+                )
+                limit_receipts = 50
+            elif subscription_type == "pro":
+                price_amount = 200
+                title = "Pro подписка ExpenseCatBot"
+                description = (
+                    "Получите Pro подписку и увеличьте лимит до 100 чеков в месяц!\n\n"
+                    "✨ Что входит:\n"
+                    "• 100 чеков в месяц (вместо 10)\n"
+                    "• Все функции бота без ограничений"
+                )
+                limit_receipts = 100
+            elif subscription_type == "premium":
+                price_amount = 500
+                title = "Premium подписка ExpenseCatBot"
+                description = (
+                    "Получите Premium подписку с безлимитным количеством чеков!\n\n"
+                    "✨ Что входит:\n"
+                    "• Безлимит чеков\n"
+                    "• Все функции бота без ограничений"
+                )
+                limit_receipts = None  # Безлимит
+            
+            price = LabeledPrice(label=f"{subscription_type.capitalize()} подписка (1 месяц)", amount=price_amount)
+            
+            # Для Telegram Stars provider_token не требуется
+            invoice_kwargs = {
+                "chat_id": callback.from_user.id,
+                "title": title,
+                "description": description,
+                "payload": f"subscription_{subscription_type}_{callback.from_user.id}_{int(datetime.utcnow().timestamp())}",
+                "currency": "XTR",  # XTR - валюта Telegram Stars
+                "prices": [price],
+                "start_parameter": f"{subscription_type}_subscription",
+                "need_name": False,
+                "need_phone_number": False,
+                "need_email": False,
+                "need_shipping_address": False,
+                "send_phone_number_to_provider": False,
+                "send_email_to_provider": False,
+                "is_flexible": False,
+            }
+            
+            # Для Telegram Stars provider_token не нужен, но aiogram может требовать его
+            try:
+                await self.bot.send_invoice(**invoice_kwargs)
+                await callback.answer()
+            except TypeError:
+                # Если aiogram требует provider_token, передаем пустую строку
+                invoice_kwargs["provider_token"] = ""
+                await self.bot.send_invoice(**invoice_kwargs)
+                await callback.answer()
+            except Exception as exc:
+                logging.exception(f"Error sending invoice: {exc}")
+                await callback.answer("Ошибка при создании счета. Попробуйте позже.", show_alert=True)
+        
+        @self.router.pre_checkout_query()
+        async def handle_pre_checkout_query(pre_checkout_query: PreCheckoutQuery) -> None:
+            """Обработчик предварительной проверки платежа"""
+            await pre_checkout_query.answer(ok=True)
+        
+        @self.router.message(F.successful_payment)
+        async def handle_successful_payment(message: Message) -> None:
+            """Обработчик успешной оплаты подписки"""
+            if not message.from_user or not message.successful_payment:
+                return
+            
+            payment = message.successful_payment
+            user_id = message.from_user.id
+            
+            # Проверяем, что это оплата подписки
+            if payment.invoice_payload.startswith("subscription_"):
+                try:
+                    # Извлекаем тип подписки из payload: subscription_{type}_{user_id}_{timestamp}
+                    payload_parts = payment.invoice_payload.split("_")
+                    if len(payload_parts) >= 2:
+                        subscription_type = payload_parts[1]  # pro или premium
+                    else:
+                        subscription_type = "pro"  # По умолчанию pro для старых payload
+                    
+                    # Активируем подписку на 1 месяц
+                    if self.supabase:
+                        subscription = await self.supabase.activate_subscription(
+                            user_id=user_id,
+                            subscription_type=subscription_type,
+                            months=1
+                        )
+                        expires_at = subscription.get("expires_at")
+                        if expires_at:
+                            try:
+                                if isinstance(expires_at, str):
+                                    expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                                else:
+                                    expires_dt = expires_at
+                                expires_str = expires_dt.strftime("%d.%m.%Y")
+                            except:
+                                expires_str = "через месяц"
+                        else:
+                            expires_str = "через месяц"
+                        
+                        # Формируем сообщение в зависимости от типа подписки
+                        if subscription_type == "premium":
+                            subscription_name = "Premium"
+                            limit_text = "Безлимит чеков"
+                            emoji = "👑"
+                        elif subscription_type == "pro":
+                            subscription_name = "Pro"
+                            limit_text = "100 чеков в месяц"
+                            emoji = "⭐"
+                        elif subscription_type == "standard":
+                            subscription_name = "Standard"
+                            limit_text = "50 чеков в месяц"
+                            emoji = "📦"
+                        else:
+                            subscription_name = "Unknown"
+                            limit_text = "Неизвестный лимит"
+                            emoji = "❓"
+                        
+                        await message.answer(
+                            f"✅ Спасибо за покупку!\n\n"
+                            f"{emoji} {subscription_name} подписка активирована до {expires_str}\n\n"
+                            f"Теперь у вас:\n"
+                            f"• {limit_text}\n"
+                            f"• Все функции бота доступны без ограничений\n\n"
+                            f"Приятного использования! 🚀"
+                        )
+                        logging.info(f"{subscription_name} subscription activated for user {user_id}")
+                    else:
+                        await message.answer(
+                            "⚠️ Оплата получена, но не удалось активировать подписку. "
+                            "Обратитесь в поддержку."
+                        )
+                except Exception as exc:
+                    logging.exception(f"Error activating subscription after payment: {exc}")
+                    await message.answer(
+                        "⚠️ Произошла ошибка при активации подписки. "
+                        "Обратитесь в поддержку через /feedback"
+                    )
 
         @self.router.message(Command("receipt"))
         async def handle_receipt_entry(message: Message, state: FSMContext) -> None:
@@ -2958,8 +3494,11 @@ class ExpenseCatBot:
                     await callback.message.answer(
                         f"⚠️ Достигнут лимит пробного периода\n\n"
                         f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
-                        f"Для продолжения распознавания чеков необходимо оформить подписку.\n"
-                        f"Свяжитесь с администратором для получения доступа.\n\n"
+                        f"Для продолжения распознавания чеков оформите подписку:\n"
+                        f"• 📦 Standard — 50 чеков/месяц за 100 ⭐\n"
+                        f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
+                        f"• 👑 Premium — безлимит за 500 ⭐\n\n"
+                        f"Используйте команду /subscribe для выбора тарифа.\n\n"
                         f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
                         f"• 📊 Получение отчетов (/report)\n"
                         f"• 📥 Выгрузка данных в CSV (/export)\n"
@@ -3312,8 +3851,10 @@ class ExpenseCatBot:
                 await message.answer(
                     f"⚠️ Достигнут лимит пробного периода\n\n"
                     f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
-                    f"Для продолжения распознавания чеков необходимо оформить подписку.\n"
-                    f"Свяжитесь с администратором для получения доступа.\n\n"
+                    f"Для продолжения распознавания чеков оформите подписку:\n"
+                    f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
+                    f"• 👑 Premium — безлимит за 500 ⭐\n\n"
+                    f"Используйте команду /subscribe для выбора тарифа.\n\n"
                     f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
                     f"• 📊 Получение отчетов (/report)\n"
                     f"• 📥 Выгрузка данных в CSV (/export)\n"
@@ -5943,10 +6484,17 @@ def extract_receipt_text(file_bytes: bytes, force_engine: Optional[str] = None) 
     # Проверяем доступность выбранного OCR движка
     if engine == "paddleocr":
         if not PADDLEOCR_AVAILABLE or PaddleOCR is None:
-            raise ReceiptParsingError(
-                "PaddleOCR не настроен: установите paddlepaddle и paddleocr."
-            )
+            logging.warning("PaddleOCR не установлен, переключаемся на Tesseract")
+            engine = "tesseract"
     else:
+            # Проверяем, может ли PaddleOCR инициализироваться
+            ocr_instance = get_paddleocr_instance()
+            if ocr_instance is None:
+                logging.warning("PaddleOCR не может подключиться к хостам моделей, переключаемся на Tesseract")
+                engine = "tesseract"
+    
+    # Проверяем доступность Tesseract (после возможного переключения)
+    if engine == "tesseract":
         if not TESSERACT_AVAILABLE or Image is None or pytesseract is None:
             raise ReceiptParsingError(
                 "Tesseract не настроен: установите Tesseract, pytesseract и Pillow."
@@ -7299,7 +7847,7 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
                 # Ищем количество и цену за единицу (формат: "13 299.00 x 1" или "13299.00 x 1")
                 # Ищем паттерн: число с пробелами, затем x, затем число
                 qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
-                if qty_price_match:
+            if qty_price_match:
                     unit_price_str = qty_price_match.group(1).replace(' ', '')
                     quantity_str = qty_price_match.group(2)
                     unit_price = float(unit_price_str)
@@ -7309,7 +7857,7 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
                     if abs(total_price - expected_total) > 0.01:
                         # Используем вычисленное значение, если оно отличается
                         total_price = expected_total
-                else:
+            else:
                     # Если не нашли количество, предполагаем quantity = 1
                     quantity = 1.0
                     unit_price = total_price
