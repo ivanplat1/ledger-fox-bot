@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["tesseract", "zbar"]
+nixPkgs = ["python311", "tesseract", "zbar"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
 
 [phases.build]
 cmds = ["echo 'Build complete'"]
