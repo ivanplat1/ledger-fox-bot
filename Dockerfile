@@ -4,14 +4,18 @@
 FROM python:3.11-slim
 
 # Установка системных зависимостей
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-kaz \
     libzbar0 \
     libgl1-mesa-glx \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/* \
+    && rm -rf /var/tmp/*
 
 # Установка рабочей директории
 WORKDIR /app
