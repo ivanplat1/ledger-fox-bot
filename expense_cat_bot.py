@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -198,6 +199,9 @@ class ProcessingResult:
     parsed_receipt: Optional[ParsedReceipt] = None
     receipt_payload: Optional[Dict[str, Any]] = None
     qr_url_found_but_failed: Optional[str] = None  # URL QR-кода, если он был найден, но данные не получены
+    file_bytes: Optional[bytes] = None  # Байты файла для возможного сохранения при отклонении
+    mime_type: Optional[str] = None  # MIME тип файла
+    recognition_method: Optional[str] = None  # Способ распознавания: 'qr', 'openai_photo', 'openai_qr_data'
 
 
 @dataclass
@@ -221,10 +225,33 @@ RECEIPT_BASE_PROMPT = (
         "\"purchased_at\": iso8601 datetime (UTC или локальная зона), \"currency\": ISO4217, "
         "\"total\": float, \"tax_amount\": float | null, "
         "\"items\": [{\"name\": str, \"quantity\": float, \"price\": float, \"category\": str | null}]}."
-    "\n\nВАЖНО: "
-    "- \"quantity\" - это количество товара (например, 2, 3, 1.5)"
-    "- \"price\" - это ОБЩАЯ сумма за позицию (количество × цена за единицу), а не цена за единицу"
-    "- Для каждого товара определи категорию на основе его названия. "
+    "\n\nКРИТИЧЕСКИ ВАЖНО - как читать чеки:"
+    "\nНа чеках обычно есть колонки: название товара | ЦЕНА ЗА ЕДИНИЦУ | КОЛИЧЕСТВО | ИТОГО ЗА ПОЗИЦИЮ"
+    "\n- \"quantity\" - это КОЛИЧЕСТВО товара (сколько штук/кг/литров куплено). Примеры: 2, 3, 1.5, 0.5, 3.452"
+    "\n- \"price\" - это ИТОГОВАЯ сумма за всю позицию (цена за единицу × количество). Примеры: если купили 2 штуки по 5.49, то price = 10.98"
+    "\n\nПРАВИЛА ИЗВЛЕЧЕНИЯ:"
+    "\n1. Если на чеке написано \"Товар × 2 = 10.98\", то quantity = 2, price = 10.98"
+    "\n2. Если на чеке написано \"Товар 5.49 × 2 = 10.98\", то quantity = 2, price = 10.98 (НЕ 5.49!)"
+    "\n3. Если на чеке написано \"Товар 3.452 кг × 34.89 = 120.44\", то quantity = 3.452, price = 120.44"
+    "\n4. Если на чеке только одна колонка с суммой (без количества), то quantity = 1, price = эта сумма"
+    "\n5. НИКОГДА не путай цену за единицу с количеством! Количество обычно меньше итоговой суммы (кроме случаев когда quantity = 1)"
+    "\n\nКРИТИЧЕСКИ ВАЖНО - обработка одинаковых и похожих позиций:"
+    "\n- Если в чеке есть ДВЕ ОДИНАКОВЫЕ позиции (например, \"Молоко\" появляется дважды), НЕ ОБЪЕДИНЯЙ их в одну!"
+    "\n- Если в чеке есть ДВЕ ПОХОЖИЕ позиции с одинаковым брендом (например, \"Bonduelle Кукуруза\" и \"Bonduelle Горошек\"), НЕ ОБЪЕДИНЯЙ их в одну!"
+    "\n- Каждая строка в чеке должна быть ОТДЕЛЬНЫМ элементом в массиве items"
+    "\n- Даже если товары одинаковые или похожие, сохраняй их как разные элементы массива"
+    "\n- Пример 1: если в чеке \"Молоко × 1 = 50\" и \"Молоко × 1 = 50\", то items должен содержать ДВА элемента: [{\"name\": \"Молоко\", \"quantity\": 1, \"price\": 50}, {\"name\": \"Молоко\", \"quantity\": 1, \"price\": 50}]"
+    "\n- Пример 2: если в чеке \"Bonduelle Кукуруза × 1 = 595\" и \"Bonduelle Горошек × 1 = 595\", то items должен содержать ДВА элемента: [{\"name\": \"Bonduelle Кукуруза\", \"quantity\": 1, \"price\": 595}, {\"name\": \"Bonduelle Горошек\", \"quantity\": 1, \"price\": 595}]"
+    "\n- НЕ ДЕЛАЙ так: [{\"name\": \"Молоко\", \"quantity\": 2, \"price\": 100}] - это НЕПРАВИЛЬНО!"
+    "\n- НЕ ДЕЛАЙ так: [{\"name\": \"Bonduelle\", \"quantity\": 2, \"price\": 1190}] - это НЕПРАВИЛЬНО!"
+    "\n- ВАЖНО: Каждая отдельная строка в чеке = отдельный элемент в массиве items. Не объединяй строки, даже если они похожи!"
+    "\n\nКРИТИЧЕСКИ ВАЖНО - названия товаров:"
+    "\n- Сохраняй ПОЛНОЕ название товара из чека, НЕ ОБРЕЗАЙ его!"
+    "\n- Если в чеке написано \"Птицынно-куриный тандалмалы бодене жумырткасы\", то name должен быть \"Птицынно-куриный тандалмалы бодене жумырткасы\", а НЕ \"Птицынно-куриный тандалмалы\""
+    "\n- Полное название важно для правильного определения категории товара"
+    "\n- НЕ сокращай названия товаров, даже если они длинные"
+    "\n- НЕ обрезай названия товаров до определенной длины"
+    "\n\nДля каждого товара определи категорию на основе его ПОЛНОГО названия. "
     "Используй категории: "
     "\"Продукты\", \"Мясо/Рыба\", \"Молочные продукты\", \"Хлеб/Выпечка\", "
     "\"Овощи/Фрукты\", \"Напитки\", \"Алкоголь\", \"Сладости\", \"Кондитерские изделия\", "
@@ -374,7 +401,7 @@ def get_paddleocr_instance():
                 )
             else:
                 logging.error(f"Failed to initialize PaddleOCR: {exc}")
-            _paddleocr_instance = False
+                _paddleocr_instance = False
             return None
     
     # Если _paddleocr_instance == False, значит была ошибка сети, возвращаем None
@@ -390,6 +417,67 @@ class ReceiptParsingError(RuntimeError):
 
 class StatementParsingError(RuntimeError):
     """Raised when bank statement parsing fails."""
+
+
+def format_user_friendly_error(exc: Exception) -> str:
+    """
+    Преобразует технические ошибки в понятные сообщения для пользователя.
+    """
+    error_str = str(exc)
+    error_type = type(exc).__name__
+    
+    # Проверяем тип исключения
+    import requests
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "Превышено время ожидания ответа от сервера. Пожалуйста, попробуйте отправить фото чека еще раз."
+    
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "Не удалось подключиться к серверу распознавания. Пожалуйста, попробуйте позже."
+    
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "Ошибка при отправке запроса. Пожалуйста, попробуйте позже."
+    
+    # Ошибки таймаута (по тексту)
+    if "timeout" in error_str.lower() or "timed out" in error_str.lower() or "read timeout" in error_str.lower():
+        return "Превышено время ожидания ответа от сервера. Пожалуйста, попробуйте отправить фото чека еще раз."
+    
+    # Ошибки соединения
+    if "connection" in error_str.lower() or "HTTPSConnectionPool" in error_str or "ConnectionPool" in error_str:
+        return "Не удалось подключиться к серверу распознавания. Пожалуйста, попробуйте позже."
+    
+    # Ошибки сети
+    if "network" in error_str.lower() or "socket" in error_str.lower() or "dns" in error_str.lower():
+        return "Ошибка сетевого соединения. Проверьте подключение к интернету и попробуйте еще раз."
+    
+    # Ошибки OpenAI API
+    if "openai" in error_str.lower() or "api.openai.com" in error_str.lower():
+        if "rate limit" in error_str.lower():
+            return "Превышен лимит запросов. Пожалуйста, подождите немного и попробуйте еще раз."
+        if "401" in error_str or "unauthorized" in error_str.lower():
+            return "Ошибка авторизации. Обратитесь в поддержку через /feedback"
+        if "429" in error_str:
+            return "Слишком много запросов. Пожалуйста, подождите немного и попробуйте еще раз."
+        if "500" in error_str or "502" in error_str or "503" in error_str:
+            return "Сервер временно недоступен. Пожалуйста, попробуйте позже."
+        return "Ошибка при распознавании чека. Пожалуйста, попробуйте отправить фото чека еще раз."
+    
+    # Ошибки обработки изображения
+    if "image" in error_str.lower() or "pil" in error_str.lower() or "pillow" in error_str.lower():
+        return "Не удалось обработать изображение. Убедитесь, что файл является корректным изображением."
+    
+    # Ошибки JSON парсинга
+    if "json" in error_str.lower() or "parse" in error_str.lower():
+        return "Не удалось распознать данные чека. Пожалуйста, попробуйте отправить фото чека еще раз."
+    
+    # Если это уже дружелюбное сообщение (не содержит технических деталей), возвращаем как есть
+    if not any(keyword in error_str.lower() for keyword in [
+        "error", "exception", "failed", "timeout", "connection", "http", "api", 
+        "traceback", "stack", "trace", "file", "line", "code", "status"
+    ]):
+        return error_str
+    
+    # Общие ошибки - показываем дружелюбное сообщение без технических деталей
+    return "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз или убедитесь, что на фото четко виден кассовый чек."
 
 
 class ReceiptParserAI:
@@ -426,16 +514,25 @@ class ReceiptParserAI:
         Отправляет изображение в OpenAI и возвращает полный JSON response без изменений.
         Если передан qr_data, отправляются данные для структурирования (без изображения).
         """
-        # Если есть данные из QR-кода, отправляем их для структурирования БЕЗ изображения
+        # Если есть данные из QR-кода, проверяем, содержат ли они позиции товаров
         if qr_data:
-            logging.info("Используем данные из QR-кода для структурирования, изображение НЕ отправляется")
-            payload = self._build_payload("", qr_data=qr_data)
+            items_in_qr = qr_data.get("items") or []
+            # Если в данных из QR-кода нет позиций или только одна позиция "Без позиций", используем изображение
+            if not items_in_qr or (len(items_in_qr) == 1 and items_in_qr[0].get("name") in ["Без позиций", "Покупка"]):
+                logging.warning(f"⚠️ Данные из QR-кода не содержат позиций товаров (items: {len(items_in_qr)}), используем изображение для распознавания")
+                if not mime_type.startswith("image/"):
+                    raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
+                data_url = build_data_url(file_bytes, mime_type)
+                payload = self._build_payload(data_url)
+            else:
+                logging.info(f"✅ Используем данные из QR-кода для структурирования (найдено {len(items_in_qr)} позиций), изображение НЕ отправляется")
+                payload = self._build_payload("", qr_data=qr_data)
         else:
             # Если QR-кода нет, используем изображение
             if not mime_type.startswith("image/"):
                 raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-        data_url = build_data_url(file_bytes, mime_type)
-        payload = self._build_payload(data_url)
+            data_url = build_data_url(file_bytes, mime_type)
+            payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -560,7 +657,23 @@ class ReceiptParserAI:
                 f"Интернет/Связь, Мобильная связь, Подписки, Стриминг, "
                 f"Страхование, Налоги, Штрафы, Банковские услуги, "
                 f"Ремонт, Строительные материалы, Инструменты, Садоводство, "
-                f"Животные, Корм для животных, Ветеринария, Другое."
+                f"Животные, Корм для животных, Ветеринария, Другое.\n\n"
+                f"КРИТИЧЕСКИ ВАЖНО - обработка одинаковых и похожих позиций:"
+                f"\n- Если в данных есть ДВЕ ОДИНАКОВЫЕ позиции (например, \"Молоко\" появляется дважды), НЕ ОБЪЕДИНЯЙ их в одну!"
+                f"\n- Если в данных есть ДВЕ ПОХОЖИЕ позиции с одинаковым брендом (например, \"Bonduelle Кукуруза\" и \"Bonduelle Горошек\"), НЕ ОБЪЕДИНЯЙ их в одну!"
+                f"\n- Каждая позиция должна быть ОТДЕЛЬНЫМ элементом в массиве items"
+                f"\n- Даже если товары одинаковые или похожие, сохраняй их как разные элементы массива"
+                f"\n- Пример 1: если в данных \"Молоко × 1 = 50\" и \"Молоко × 1 = 50\", то items должен содержать ДВА элемента: [{{\"name\": \"Молоко\", \"quantity\": 1, \"price\": 50}}, {{\"name\": \"Молоко\", \"quantity\": 1, \"price\": 50}}]"
+                f"\n- Пример 2: если в данных \"Bonduelle Кукуруза × 1 = 595\" и \"Bonduelle Горошек × 1 = 595\", то items должен содержать ДВА элемента: [{{\"name\": \"Bonduelle Кукуруза\", \"quantity\": 1, \"price\": 595}}, {{\"name\": \"Bonduelle Горошек\", \"quantity\": 1, \"price\": 595}}]"
+                f"\n- НЕ ДЕЛАЙ так: [{{\"name\": \"Молоко\", \"quantity\": 2, \"price\": 100}}] - это НЕПРАВИЛЬНО!"
+                f"\n- НЕ ДЕЛАЙ так: [{{\"name\": \"Bonduelle\", \"quantity\": 2, \"price\": 1190}}] - это НЕПРАВИЛЬНО!"
+                f"\n- ВАЖНО: Каждая отдельная строка в чеке = отдельный элемент в массиве items. Не объединяй строки, даже если они похожи!"
+                f"\n\nКРИТИЧЕСКИ ВАЖНО - названия товаров:"
+                f"\n- Сохраняй ПОЛНОЕ название товара из данных, НЕ ОБРЕЗАЙ его!"
+                f"\n- Если в данных написано \"Птицынно-куриный тандалмалы бодене жумырткасы\", то name должен быть \"Птицынно-куриный тандалмалы бодене жумырткасы\", а НЕ \"Птицынно-куриный тандалмалы\""
+                f"\n- Полное название важно для правильного определения категории товара"
+                f"\n- НЕ сокращай названия товаров, даже если они длинные"
+                f"\n- НЕ обрезай названия товаров до определенной длины"
             )
             logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
             
@@ -628,11 +741,27 @@ class ReceiptParserAI:
         headers_for_log = {k: (v[:20] + "..." if k == "Authorization" else v) for k, v in headers.items()}
         logging.info(f"OpenAI request URL: {url}")
         logging.info(f"OpenAI request headers: {json.dumps(headers_for_log, ensure_ascii=False)}")
-        resp = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
+        try:
+            resp = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
+        except Exception as exc:
+            # Преобразуем технические ошибки в понятные сообщения
+            user_friendly_msg = format_user_friendly_error(exc)
+            raise ReceiptParsingError(user_friendly_msg) from exc
+        
         if resp.status_code >= 400:
-            raise ReceiptParsingError(
-                f"OpenAI error {resp.status_code}: {resp.text[:500]}"
-            )
+            # Преобразуем ошибки API в понятные сообщения
+            error_text = resp.text[:500] if resp.text else ""
+            if resp.status_code == 429:
+                user_msg = "Слишком много запросов. Пожалуйста, подождите немного и попробуйте еще раз."
+            elif resp.status_code == 401:
+                user_msg = "Ошибка авторизации. Обратитесь в поддержку через /feedback"
+            elif resp.status_code >= 500:
+                user_msg = "Сервер временно недоступен. Пожалуйста, попробуйте позже."
+            elif "rate limit" in error_text.lower():
+                user_msg = "Превышен лимит запросов. Пожалуйста, подождите немного и попробуйте еще раз."
+            else:
+                user_msg = "Ошибка при распознавании чека. Пожалуйста, попробуйте отправить фото чека еще раз."
+            raise ReceiptParsingError(user_msg)
         return resp.json()
 
 
@@ -660,6 +789,11 @@ class SupabaseGateway:
         self.settings_table = settings_table
         self.feedback_table = feedback_table
         self.limits_table = limits_table
+        
+        # Кэш лимитов пользователей: {user_id: (limits_dict, timestamp)}
+        # TTL кэша: 60 секунд
+        self._limits_cache: Dict[int, tuple[Dict[str, Any], float]] = {}
+        self._limits_cache_ttl = 60.0  # секунды
 
     async def check_receipt_exists(self, receipt_hash: str) -> bool:
         """Проверяет, существует ли чек с данным хешем."""
@@ -681,21 +815,29 @@ class SupabaseGateway:
         Сохраняет или обновляет чек в базе.
         Возвращает (данные чека, is_duplicate) где is_duplicate=True если чек уже существовал.
         """
+        start_time = time.perf_counter()
         receipt_hash = payload.get("receipt_hash")
         logging.info("Upserting receipt %s", receipt_hash)
         
         # Проверяем, существует ли чек
+        check_start = time.perf_counter()
         is_duplicate = await self.check_receipt_exists(receipt_hash)
+        check_time = time.perf_counter() - check_start
+        if check_time > 0.1:
+            logging.info(f"⏱️ [PERF] Проверка дубликата чека: {check_time*1000:.1f}ms")
         
         if is_duplicate:
             logging.info("Receipt with hash %s already exists, will update if data differs", receipt_hash)
         
+        upsert_start = time.perf_counter()
         stored_receipt = await asyncio.to_thread(
             self._table_upsert,
             self.receipts_table,
             payload,
             on_conflict="receipt_hash",
         )
+        upsert_time = time.perf_counter() - upsert_start
+        logging.info(f"⏱️ [PERF] Сохранение чека в БД: {upsert_time*1000:.1f}ms")
         
         # Проверяем, что получили реальную запись из базы (с id)
         if stored_receipt and stored_receipt.get("id"):
@@ -705,6 +847,9 @@ class SupabaseGateway:
                 logging.info("Receipt created: id=%s, hash=%s", stored_receipt.get("id"), receipt_hash)
         else:
             logging.warning("Upsert returned receipt without id, using payload as fallback")
+        
+        total_time = time.perf_counter() - start_time
+        logging.info(f"⏱️ [PERF] upsert_receipt всего: {total_time*1000:.1f}ms")
         
         return stored_receipt, is_duplicate
 
@@ -887,6 +1032,14 @@ class SupabaseGateway:
                 # Проверяем, что получили реальную запись с id
                 if record_id:
                     logging.info(f"✅ Успешно сохранено в {table}: id={record_id}")
+                    # Проверяем, что items сохранились корректно (для таблицы receipts)
+                    if table == self.receipts_table and "items" in payload:
+                        saved_items = result.data[0].get("items", [])
+                        payload_items = payload.get("items", [])
+                        if len(saved_items) != len(payload_items):
+                            logging.warning(f"⚠️ Количество items изменилось при сохранении: было {len(payload_items)}, стало {len(saved_items)}")
+                        else:
+                            logging.info(f"✅ Все {len(saved_items)} позиций сохранены корректно")
                     return result.data[0]
                 else:
                     logging.warning(f"⚠️ Supabase вернул запись без id для {table}, используем payload")
@@ -947,6 +1100,7 @@ class SupabaseGateway:
         Если указаны start_date и end_date (формат YYYY-MM-DD), используется диапазон дат.
         Категории берутся из items чеков, а не из категории расхода.
         """
+        start_time = time.perf_counter()
         query = (
             self._client.table(self.expenses_table)
             .select("*, receipt_id")
@@ -1104,6 +1258,9 @@ class SupabaseGateway:
         elif not display_period:
             display_period = datetime.utcnow().strftime("%Y-%m")
         
+        total_time = time.perf_counter() - start_time
+        logging.info(f"⏱️ [PERF] _fetch_report_sync: {total_time*1000:.1f}ms ({total_time:.2f}s)")
+        
         return {
             "period": display_period,
             "currencies_data": currencies_data,
@@ -1129,6 +1286,7 @@ class SupabaseGateway:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> str:
+        start_time = time.perf_counter()
         query = self._client.table(self.expenses_table).select("*").eq("user_id", user_id)
         if period:
             query = query.ilike("period", f"{period}%")
@@ -1175,6 +1333,10 @@ class SupabaseGateway:
                         value = value.strftime("%Y-%m-%d")
                 formatted_row[key] = value
             writer.writerow(formatted_row)
+        
+        total_time = time.perf_counter() - start_time
+        logging.info(f"⏱️ [PERF] _export_expenses_csv_sync: {total_time*1000:.1f}ms ({total_time:.2f}s), записей: {len(data)}")
+        
         return buffer.getvalue()
 
     def _delete_all_user_data_sync(self, user_id: int) -> Dict[str, int]:
@@ -1375,6 +1537,48 @@ class SupabaseGateway:
             payload,
         )
     
+    async def save_receipt_recognition_stat(
+        self,
+        user_id: int,
+        recognition_method: str,
+        success: bool,
+        error_message: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Сохраняет статистику распознавания чека"""
+        payload = {
+            "user_id": user_id,
+            "recognition_method": recognition_method,
+            "success": success,
+            "error_message": error_message,
+        }
+        try:
+            return await asyncio.to_thread(
+                self._table_insert,
+                "receipt_recognition_stats",
+                payload,
+            )
+        except Exception as exc:
+            # Логируем ошибку, но не прерываем выполнение
+            logging.warning(f"Failed to save receipt recognition stat: {exc}")
+            return {}
+    
+    async def get_receipt_stats(self, user_id: int) -> Dict[str, Any]:
+        """Получает статистику распознавания чеков для пользователя"""
+        try:
+            result = await asyncio.to_thread(
+                lambda: self._client.table("receipt_stats_by_user")
+                .select("*")
+                .eq("user_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if result.data and len(result.data) > 0:
+                return result.data[0]
+            return {}
+        except Exception as exc:
+            logging.warning(f"Failed to get receipt stats: {exc}")
+            return {}
+    
     def _table_insert(self, table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Вставляет новую запись в таблицу"""
         result = self._client.table(table).insert(payload).execute()
@@ -1461,8 +1665,33 @@ class SupabaseGateway:
         """Асинхронная обертка для проверки наличия данных у пользователя"""
         return await asyncio.to_thread(self._check_user_has_data_sync, user_id)
     
+    def _get_cached_limits(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Получает лимиты из кэша, если они еще актуальны"""
+        if user_id in self._limits_cache:
+            limits, timestamp = self._limits_cache[user_id]
+            if time.perf_counter() - timestamp < self._limits_cache_ttl:
+                return limits
+            else:
+                # Кэш устарел, удаляем
+                del self._limits_cache[user_id]
+        return None
+    
+    def _set_cached_limits(self, user_id: int, limits: Dict[str, Any]) -> None:
+        """Сохраняет лимиты в кэш"""
+        self._limits_cache[user_id] = (limits, time.perf_counter())
+    
+    def _invalidate_limits_cache(self, user_id: int) -> None:
+        """Инвалидирует кэш лимитов для пользователя"""
+        if user_id in self._limits_cache:
+            del self._limits_cache[user_id]
+    
     def _get_or_create_user_limits_sync(self, user_id: int) -> Dict[str, Any]:
-        """Получает или создает запись лимитов для пользователя"""
+        """Получает или создает запись лимитов для пользователя (с кэшированием)"""
+        # Проверяем кэш
+        cached_limits = self._get_cached_limits(user_id)
+        if cached_limits is not None:
+            return cached_limits
+        
         try:
             result = (
                 self._client.table(self.limits_table)
@@ -1472,7 +1701,10 @@ class SupabaseGateway:
                 .execute()
             )
             if result.data and len(result.data) > 0:
-                return result.data[0]
+                limits = result.data[0]
+                # Сохраняем в кэш
+                self._set_cached_limits(user_id, limits)
+                return limits
             
             # Создаем новую запись с дефолтными значениями
             default_limits = {
@@ -1488,18 +1720,25 @@ class SupabaseGateway:
                 .execute()
             )
             if insert_result.data and len(insert_result.data) > 0:
-                return insert_result.data[0]
+                limits = insert_result.data[0]
+                # Сохраняем в кэш
+                self._set_cached_limits(user_id, limits)
+                return limits
+            # Сохраняем дефолтные значения в кэш
+            self._set_cached_limits(user_id, default_limits)
             return default_limits
         except Exception as exc:
             logging.exception(f"Error getting/creating user limits for user={user_id}: {exc}")
             # Возвращаем дефолтные значения при ошибке
-            return {
+            default_limits = {
                 "user_id": user_id,
                 "receipts_count": 0,
                 "limit_receipts": 10,
                 "subscription_type": "trial",
                 "expires_at": None,
             }
+            # Не кэшируем при ошибке
+            return default_limits
     
     async def get_or_create_user_limits(self, user_id: int) -> Dict[str, Any]:
         """Асинхронная обертка для получения/создания лимитов пользователя"""
@@ -1532,6 +1771,8 @@ class SupabaseGateway:
                             "subscription_type": "trial",
                             "limit_receipts": 10
                         }).eq("user_id", user_id).execute()
+                        # Инвалидируем кэш
+                        self._invalidate_limits_cache(user_id)
                     else:
                         # Premium подписка активна - безлимит
                         return True, limits
@@ -1609,17 +1850,64 @@ class SupabaseGateway:
         return await asyncio.to_thread(self._check_receipt_limit_sync, user_id)
     
     def _increment_receipt_count_sync(self, user_id: int) -> None:
-        """Увеличивает счетчик чеков пользователя"""
+        """Увеличивает счетчик чеков пользователя (оптимизированная версия с кэшем)"""
         try:
-            # Получаем текущее значение и увеличиваем
-            limits = self._get_or_create_user_limits_sync(user_id)
-            current_count = limits.get("receipts_count", 0)
-            self._client.table(self.limits_table).update({
-                "receipts_count": current_count + 1
-            }).eq("user_id", user_id).execute()
-            logging.info(f"Incremented receipt count for user={user_id}: {current_count} -> {current_count + 1}")
+            # Пытаемся получить текущее значение из кэша
+            cached_limits = self._get_cached_limits(user_id)
+            current_count = None
+            
+            if cached_limits:
+                current_count = cached_limits.get("receipts_count", 0)
+            else:
+                # Если нет в кэше, делаем SELECT только для receipts_count
+                select_result = (
+                    self._client.table(self.limits_table)
+                    .select("receipts_count")
+                    .eq("user_id", user_id)
+                    .limit(1)
+                    .execute()
+                )
+                
+                if select_result.data and len(select_result.data) > 0:
+                    current_count = select_result.data[0].get("receipts_count", 0)
+            
+            if current_count is not None:
+                # Запись существует - обновляем
+                new_count = current_count + 1
+                update_result = (
+                    self._client.table(self.limits_table)
+                    .update({"receipts_count": new_count})
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+                if update_result.data:
+                    # Обновляем кэш
+                    if cached_limits:
+                        cached_limits["receipts_count"] = new_count
+                        self._set_cached_limits(user_id, cached_limits)
+                    logging.info(f"Incremented receipt count for user={user_id}: {current_count} -> {new_count}")
+            else:
+                # Записи нет - создаем новую с receipts_count = 1
+                default_limits = {
+                    "user_id": user_id,
+                    "receipts_count": 1,
+                    "limit_receipts": 10,
+                    "subscription_type": "trial",
+                    "expires_at": None,
+                }
+                insert_result = (
+                    self._client.table(self.limits_table)
+                    .insert(default_limits)
+                    .execute()
+                )
+                if insert_result.data:
+                    # Сохраняем в кэш
+                    self._set_cached_limits(user_id, insert_result.data[0])
+                    logging.info(f"Incremented receipt count for user={user_id}: 0 -> 1 (new record)")
         except Exception as exc:
             logging.exception(f"Error incrementing receipt count for user={user_id}: {exc}")
+            # Инвалидируем кэш при ошибке
+            self._invalidate_limits_cache(user_id)
     
     async def increment_receipt_count(self, user_id: int) -> None:
         """Асинхронная обертка для увеличения счетчика чеков"""
@@ -1659,6 +1947,9 @@ class SupabaseGateway:
                 .execute()
             )
             if result.data and len(result.data) > 0:
+                # Инвалидируем кэш и обновляем его новыми данными
+                self._invalidate_limits_cache(user_id)
+                self._set_cached_limits(user_id, result.data[0])
                 return result.data[0]
             return {
                 "user_id": user_id,
@@ -1831,13 +2122,77 @@ def truncate_message_for_telegram(text: str, max_length: int = 4000) -> str:
     """
     if len(text) <= max_length:
         return text
+    
+    # Проверяем, содержит ли сообщение таблицу товаров
+    has_table = "ИТОГО" in text or "Всего товаров:" in text
+    
     # Обрезаем и добавляем индикатор обрезки
-    truncated = text[:max_length - 50]
+    truncated = text[:max_length - 150]  # Оставляем больше места для предупреждения
     # Пытаемся обрезать по последнему переносу строки
     last_newline = truncated.rfind('\n')
     if last_newline > max_length - 200:
         truncated = truncated[:last_newline]
+    
+    # Проверяем, не обрезали ли мы таблицу товаров
+    if has_table:
+        # Ищем информацию о количестве товаров в оригинальном тексте
+        import re
+        items_count_match = re.search(r'Всего товаров:\s*(\d+)', text)
+        items_sum_match = re.search(r'Сумма всех позиций:\s*([\d.]+)', text)
+        
+        if items_count_match or items_sum_match:
+            # Таблица была обрезана, но информация о товарах есть
+            warning = "\n\n⚠️ Таблица обрезана из-за большого количества товаров."
+            if items_count_match:
+                warning += f"\nВсего товаров в чеке: {items_count_match.group(1)}"
+            if items_sum_match:
+                warning += f"\nСумма всех позиций: {items_sum_match.group(1)}"
+            warning += "\nВалидация суммы выполнена по всем товарам."
+            return truncated + warning
+        elif "ИТОГО" in text and "ИТОГО" not in truncated:
+            # Таблица была обрезана до строки ИТОГО
+            return truncated + "\n\n⚠️ Таблица обрезана из-за большого количества товаров.\nВалидация суммы выполнена по всем товарам."
+    
     return truncated + "\n\n... (сообщение обрезано, слишком длинное)"
+
+
+def truncate_html_safely(text: str, max_length: int) -> str:
+    """
+    Безопасно обрезает HTML-текст, закрывая незакрытые теги.
+    """
+    if len(text) <= max_length:
+        return text
+    
+    # Список самозакрывающихся тегов (не требуют закрывающего тега)
+    self_closing_tags = {'br', 'hr', 'img', 'input', 'meta', 'link', 'area', 'base', 'col', 'embed', 'source', 'track', 'wbr'}
+    
+    # Находим все открытые теги до места обрезки
+    truncated = text[:max_length - 20]
+    
+    # Находим все открытые теги в обрезанном тексте
+    import re
+    open_tags = []
+    tag_pattern = r'<(\/?)(\w+)(?:\s[^>]*)?>'
+    
+    for match in re.finditer(tag_pattern, truncated):
+        is_closing = match.group(1) == '/'
+        tag_name = match.group(2).lower()
+        
+        if tag_name in self_closing_tags:
+            continue
+            
+        if is_closing:
+            # Удаляем соответствующий открывающий тег из стека
+            if open_tags and open_tags[-1] == tag_name:
+                open_tags.pop()
+        else:
+            # Добавляем открывающий тег в стек
+            open_tags.append(tag_name)
+    
+    # Закрываем все незакрытые теги в обратном порядке
+    closing_tags = ''.join(f'</{tag}>' for tag in reversed(open_tags))
+    
+    return truncated + "\n\n... (обрезано)" + closing_tags
 
 
 class RateLimitMiddleware:
@@ -1995,7 +2350,8 @@ class ExpenseCatBot:
         feedback_type: str,
         type_name: str,
         emoji: str,
-        feedback_text: str
+        feedback_text: str,
+        photo_bytes: Optional[bytes] = None
     ) -> None:
         """Отправляет отзыв в канал обратной связи"""
         # Формируем сообщение
@@ -2021,22 +2377,75 @@ class ExpenseCatBot:
             if chat_id.startswith("-") or chat_id.isdigit():
                 try:
                     chat_id_int = int(chat_id)
-                    await self.bot.send_message(
-                        chat_id=chat_id_int,
-                        text=message_text,
-                        parse_mode="HTML"
-                    )
+                    # Если есть фото, отправляем с фото
+                    if photo_bytes:
+                        from aiogram.types import BufferedInputFile
+                        # Обрезаем caption до 1024 символов (лимит Telegram для подписей к фото)
+                        MAX_CAPTION_LENGTH = 1024
+                        photo_caption = message_text
+                        if len(photo_caption) > MAX_CAPTION_LENGTH:
+                            # Безопасно обрезаем HTML, закрывая незакрытые теги
+                            photo_caption = truncate_html_safely(photo_caption, MAX_CAPTION_LENGTH)
+                            logging.warning(f"Feedback caption too long ({len(message_text)} chars), truncated to {len(photo_caption)} chars")
+                        
+                        photo_file = BufferedInputFile(photo_bytes, filename="feedback_photo.jpg")
+                        await self.bot.send_photo(
+                            chat_id=chat_id_int,
+                            photo=photo_file,
+                            caption=photo_caption,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        # Для текстовых сообщений лимит 4096 символов
+                        MAX_MESSAGE_LENGTH = 4096
+                        text_message = message_text
+                        if len(text_message) > MAX_MESSAGE_LENGTH:
+                            # Безопасно обрезаем HTML, закрывая незакрытые теги
+                            text_message = truncate_html_safely(text_message, MAX_MESSAGE_LENGTH)
+                            logging.warning(f"Feedback message too long ({len(message_text)} chars), truncated to {len(text_message)} chars")
+                        
+                        await self.bot.send_message(
+                            chat_id=chat_id_int,
+                            text=text_message,
+                            parse_mode="HTML"
+                        )
                     logging.info(f"✅ Feedback sent to channel {chat_id_int}")
                     return
                 except Exception as int_exc:
                     logging.warning(f"Failed to send as int {chat_id_int}: {int_exc}")
             
             # Пробуем как строку (для username каналов типа @channel_name)
-            await self.bot.send_message(
-                chat_id=chat_id,
-                text=message_text,
-                parse_mode="HTML"
-            )
+            if photo_bytes:
+                from aiogram.types import BufferedInputFile
+                # Обрезаем caption до 1024 символов (лимит Telegram для подписей к фото)
+                MAX_CAPTION_LENGTH = 1024
+                photo_caption = message_text
+                if len(photo_caption) > MAX_CAPTION_LENGTH:
+                    # Безопасно обрезаем HTML, закрывая незакрытые теги
+                    photo_caption = truncate_html_safely(photo_caption, MAX_CAPTION_LENGTH)
+                    logging.warning(f"Feedback caption too long ({len(message_text)} chars), truncated to {len(photo_caption)} chars")
+                
+                photo_file = BufferedInputFile(photo_bytes, filename="feedback_photo.jpg")
+                await self.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=photo_file,
+                    caption=photo_caption,
+                    parse_mode="HTML"
+                )
+            else:
+                # Для текстовых сообщений лимит 4096 символов
+                MAX_MESSAGE_LENGTH = 4096
+                text_message = message_text
+                if len(text_message) > MAX_MESSAGE_LENGTH:
+                    # Безопасно обрезаем HTML, закрывая незакрытые теги
+                    text_message = truncate_html_safely(text_message, MAX_MESSAGE_LENGTH)
+                    logging.warning(f"Feedback message too long ({len(message_text)} chars), truncated to {len(text_message)} chars")
+                
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=text_message,
+                    parse_mode="HTML"
+                )
             logging.info(f"✅ Feedback sent to channel {chat_id}")
         except Exception as exc:
             # Если канал не найден, логируем подробную ошибку
@@ -2058,11 +2467,15 @@ class ExpenseCatBot:
         file_path: Optional[str] = None,
         file_bytes: Optional[bytes] = None,
         mime_type: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        receipt_table: Optional[str] = None
     ) -> None:
         """Отправляет информацию о фейле чека в канал с фото"""
         if not self.failed_receipts_chat_id:
+            logging.warning("failed_receipts_chat_id not configured, skipping failed receipt notification")
             return
+        
+        logging.info(f"📤 Preparing to send failed receipt to channel: user_id={user_id}, reason={reason}, has_file_bytes={file_bytes is not None and isinstance(file_bytes, bytes) and len(file_bytes) > 0 if file_bytes else False}")
         
         # Формируем сообщение
         user_info = f"ID: {user_id}"
@@ -2091,6 +2504,18 @@ class ExpenseCatBot:
         if error_message:
             caption += f"\n💬 Ошибка:\n<code>{error_message[:500]}</code>"
         
+        # Добавляем результаты калькуляции, если они есть
+        if receipt_table:
+            # Обрезаем таблицу, если она слишком длинная
+            # Для подписей к фото лимит 1024 символа, для текстовых сообщений 4096
+            max_table_length = 2000  # Оставляем место для остального текста
+            if len(receipt_table) > max_table_length:
+                receipt_table = receipt_table[:max_table_length] + "\n\n... (обрезано)"
+            caption += f"\n\n📊 <b>Результаты калькуляции:</b>\n<pre>{receipt_table}</pre>"
+        
+        # Сохраняем полный текст для текстовых сообщений
+        full_caption = caption
+        
         # Отправляем в канал
         try:
             chat_id = self.failed_receipts_chat_id
@@ -2104,7 +2529,15 @@ class ExpenseCatBot:
                     pass
             
             # Если есть фото, отправляем его с подписью
-            if file_bytes:
+            if file_bytes and isinstance(file_bytes, bytes) and len(file_bytes) > 0:
+                # Обрезаем caption до 1024 символов (лимит Telegram для подписей к фото)
+                MAX_CAPTION_LENGTH = 1024
+                photo_caption = caption
+                if len(photo_caption) > MAX_CAPTION_LENGTH:
+                    # Безопасно обрезаем HTML, закрывая незакрытые теги
+                    photo_caption = truncate_html_safely(photo_caption, MAX_CAPTION_LENGTH)
+                    logging.warning(f"Caption too long ({len(caption)} chars), truncated to {len(photo_caption)} chars")
+                
                 # Определяем расширение файла из mime_type
                 ext_map = {
                     "image/jpeg": "jpg",
@@ -2117,13 +2550,14 @@ class ExpenseCatBot:
                 ext = ext_map.get(mime_type or "image/jpeg", "jpg")
                 filename = f"rejected_receipt_{user_id}_{reason}.{ext}"
                 
+                logging.info(f"📤 Sending failed receipt photo to channel: {len(file_bytes)} bytes, mime_type={mime_type}, caption_length={len(photo_caption)}")
                 photo = BufferedInputFile(file_bytes, filename=filename)
                 
                 if chat_id_int is not None:
                     await self.bot.send_photo(
                         chat_id=chat_id_int,
                         photo=photo,
-                        caption=caption,
+                        caption=photo_caption,
                         parse_mode="HTML"
                     )
                     logging.info(f"✅ Failed receipt photo sent to channel {chat_id_int}")
@@ -2131,23 +2565,32 @@ class ExpenseCatBot:
                     await self.bot.send_photo(
                         chat_id=chat_id,
                         photo=photo,
-                        caption=caption,
+                        caption=photo_caption,
                         parse_mode="HTML"
                     )
                     logging.info(f"✅ Failed receipt photo sent to channel {chat_id}")
             else:
                 # Если фото нет, отправляем только текст
+                logging.info(f"⚠️ No file_bytes provided or invalid, sending text-only message. file_bytes type: {type(file_bytes)}, is None: {file_bytes is None}, length: {len(file_bytes) if file_bytes else 0}")
+                # Для текстовых сообщений лимит 4096 символов
+                MAX_MESSAGE_LENGTH = 4096
+                text_message = full_caption
+                if len(text_message) > MAX_MESSAGE_LENGTH:
+                    # Безопасно обрезаем HTML, закрывая незакрытые теги
+                    text_message = truncate_html_safely(text_message, MAX_MESSAGE_LENGTH)
+                    logging.warning(f"Message too long ({len(full_caption)} chars), truncated to {len(text_message)} chars")
+                
                 if chat_id_int is not None:
                     await self.bot.send_message(
                         chat_id=chat_id_int,
-                        text=caption,
+                        text=text_message,
                         parse_mode="HTML"
                     )
                     logging.info(f"✅ Failed receipt info sent to channel {chat_id_int}")
                 else:
                     await self.bot.send_message(
                         chat_id=chat_id,
-                        text=caption,
+                        text=text_message,
                         parse_mode="HTML"
                     )
                     logging.info(f"✅ Failed receipt info sent to channel {chat_id}")
@@ -2218,6 +2661,7 @@ class ExpenseCatBot:
             BotCommand(command="subscribe", description="Оформить подписку Premium"),
             BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
+            BotCommand(command="stats", description="Статистика распознавания чеков"),
             BotCommand(command="delete_expense", description="Удалить расход"),
             BotCommand(command="delete_all", description="Удалить все данные"),
         ]
@@ -2361,6 +2805,89 @@ class ExpenseCatBot:
                     status_text += f"\n⚠️ Осталось мало чеков! Используйте /subscribe\n"
             
             await message.answer(status_text, parse_mode="HTML")
+        
+        @self.router.message(Command("stats"))
+        async def handle_stats(message: Message) -> None:
+            """Обработчик команды /stats - показывает статистику распознавания чеков"""
+            if not message.from_user:
+                await message.answer("Не удалось определить пользователя.")
+                return
+            
+            if not self.supabase:
+                await message.answer("База данных недоступна.")
+                return
+            
+            try:
+                stats = await self.supabase.get_receipt_stats(message.from_user.id)
+                
+                if not stats or stats.get("total_count", 0) == 0:
+                    await message.answer(
+                        "📊 Статистика распознавания чеков\n\n"
+                        "Пока нет данных о распознавании чеков.\n"
+                        "Отправьте фото чека, чтобы начать собирать статистику."
+                    )
+                    return
+                
+                total_successful = stats.get("total_successful", 0)
+                total_failed = stats.get("total_failed", 0)
+                total_count = stats.get("total_count", 0)
+                overall_success_rate = stats.get("overall_success_rate", 0)
+                
+                qr_successful = stats.get("qr_successful", 0)
+                qr_failed = stats.get("qr_failed", 0)
+                qr_total = qr_successful + qr_failed
+                
+                openai_photo_successful = stats.get("openai_photo_successful", 0)
+                openai_photo_failed = stats.get("openai_photo_failed", 0)
+                openai_photo_total = openai_photo_successful + openai_photo_failed
+                
+                openai_qr_data_successful = stats.get("openai_qr_data_successful", 0)
+                openai_qr_data_failed = stats.get("openai_qr_data_failed", 0)
+                openai_qr_data_total = openai_qr_data_successful + openai_qr_data_failed
+                
+                response = (
+                    f"📊 <b>Статистика распознавания чеков</b>\n\n"
+                    f"📈 <b>Общая статистика:</b>\n"
+                    f"✅ Успешно: {total_successful}\n"
+                    f"❌ Неуспешно: {total_failed}\n"
+                    f"📊 Всего: {total_count}\n"
+                    f"📈 Успешность: {overall_success_rate}%\n\n"
+                )
+                
+                if qr_total > 0:
+                    qr_success_rate = round(100.0 * qr_successful / qr_total, 2) if qr_total > 0 else 0
+                    response += (
+                        f"🔍 <b>По QR-коду:</b>\n"
+                        f"✅ Успешно: {qr_successful}\n"
+                        f"❌ Неуспешно: {qr_failed}\n"
+                        f"📊 Всего: {qr_total}\n"
+                        f"📈 Успешность: {qr_success_rate}%\n\n"
+                    )
+                
+                if openai_photo_total > 0:
+                    openai_photo_success_rate = round(100.0 * openai_photo_successful / openai_photo_total, 2) if openai_photo_total > 0 else 0
+                    response += (
+                        f"🖼️ <b>По фото (OpenAI):</b>\n"
+                        f"✅ Успешно: {openai_photo_successful}\n"
+                        f"❌ Неуспешно: {openai_photo_failed}\n"
+                        f"📊 Всего: {openai_photo_total}\n"
+                        f"📈 Успешность: {openai_photo_success_rate}%\n\n"
+                    )
+                
+                if openai_qr_data_total > 0:
+                    openai_qr_data_success_rate = round(100.0 * openai_qr_data_successful / openai_qr_data_total, 2) if openai_qr_data_total > 0 else 0
+                    response += (
+                        f"🔗 <b>По QR-данным (OpenAI):</b>\n"
+                        f"✅ Успешно: {openai_qr_data_successful}\n"
+                        f"❌ Неуспешно: {openai_qr_data_failed}\n"
+                        f"📊 Всего: {openai_qr_data_total}\n"
+                        f"📈 Успешность: {openai_qr_data_success_rate}%\n"
+                    )
+                
+                await message.answer(response, parse_mode="HTML")
+            except Exception as exc:
+                logging.exception(f"Error getting receipt stats: {exc}")
+                await message.answer("Ошибка при получении статистики. Попробуйте позже.")
         
         @self.router.message(Command("subscribe"))
         async def handle_subscribe(message: Message) -> None:
@@ -2718,8 +3245,100 @@ class ExpenseCatBot:
             truncated_result = truncate_message_for_telegram(result_text)
             await message.answer(truncated_result)
 
+        @self.router.message(FeedbackStates.waiting_for_feedback_text, F.photo | F.document)
+        async def handle_feedback_photo(message: Message, state: FSMContext) -> None:
+            """Обработчик фото/документов в контексте обратной связи"""
+            # Сохраняем фото как часть обратной связи, не обрабатываем как чек
+            data = await state.get_data()
+            feedback_type = data.get("feedback_type", "unknown")
+            
+            user_id = message.from_user.id if message.from_user else None
+            username = message.from_user.username if message.from_user else "unknown"
+            first_name = message.from_user.first_name if message.from_user else "unknown"
+            
+            type_names = {
+                "bug": "ошибка",
+                "suggestion": "предложение",
+                "complaint": "жалоба"
+            }
+            type_emojis = {
+                "bug": "🐛",
+                "suggestion": "💡",
+                "complaint": "😞"
+            }
+            
+            type_name = type_names.get(feedback_type, feedback_type)
+            emoji = type_emojis.get(feedback_type, "📝")
+            
+            # Получаем текст обратной связи: сначала из подписи к фото, потом из состояния, потом заглушка
+            if message.caption:
+                feedback_text = message.caption.strip()
+            else:
+                feedback_text = data.get("feedback_text", "Фото приложено к обратной связи")
+            
+            # Если фото есть, добавляем информацию о нем
+            if message.photo or message.document:
+                file_type = "фото" if message.photo else "документ"
+                if not message.caption:  # Добавляем информацию о файле только если не было подписи
+                    feedback_text += f"\n\n📎 Приложен {file_type}"
+            
+            # Логируем обратную связь с фото
+            logging.info(
+                f"Feedback [{feedback_type}] with photo from user_id={user_id} "
+                f"(@{username}, {first_name}): {feedback_text}"
+            )
+            
+            # Сохраняем в базу данных, если Supabase подключен
+            if self.supabase:
+                try:
+                    await self.supabase.save_feedback(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        feedback_text=feedback_text
+                    )
+                except Exception as exc:
+                    logging.exception(f"Ошибка при сохранении отзыва с фото в базу данных: {exc}")
+            
+            # Отправляем в канал обратной связи, если настроен
+            if self.feedback_chat_id:
+                try:
+                    # Отправляем фото в канал, если есть
+                    photo_bytes = None
+                    if message.photo:
+                        # Берем самое большое фото
+                        photo = message.photo[-1]
+                        file = await self.bot.get_file(photo.file_id)
+                        photo_bytes = await self._download_file(file.file_path)
+                    elif message.document:
+                        file = await self.bot.get_file(message.document.file_id)
+                        photo_bytes = await self._download_file(file.file_path)
+                    
+                    await self._send_feedback_to_channel(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        type_name=type_name,
+                        emoji=emoji,
+                        feedback_text=feedback_text,
+                        photo_bytes=photo_bytes
+                    )
+                except Exception as exc:
+                    logging.exception(f"Ошибка при отправке отзыва с фото в канал: {exc}")
+            
+            await message.answer(
+                f"✅ Спасибо за вашу обратную связь!\n\n"
+                f"{emoji} Тип: {type_name}\n"
+                f"📝 Сообщение: {feedback_text}\n\n"
+                f"Ваше сообщение с фото сохранено и будет рассмотрено."
+            )
+            await state.clear()
+
         @self.router.message(F.photo | F.document)
         async def handle_smart_upload(message: Message, state: FSMContext) -> None:
+            
             if message.media_group_id:
                 await self._collect_media_group(message)
                 return
@@ -3470,46 +4089,63 @@ class ExpenseCatBot:
         @self.router.callback_query(F.data == "receipt_confirm")
         async def handle_receipt_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             """Обработчик подтверждения чека"""
-            await callback.answer()
-            data = await state.get_data()
-            parsed_receipt = data.get("parsed_receipt")
-            receipt_payload = data.get("receipt_payload")
-            
-            if not receipt_payload or not callback.from_user:
-                await callback.message.answer("Ошибка: данные чека не найдены.")
-                await state.clear()
-                return
-            
-            if not callback.from_user:
-                await callback.message.answer("Ошибка: не удалось определить пользователя.")
-                await state.clear()
-                return
-            
-            # Проверяем лимит чеков перед сохранением
-            if self.supabase:
-                can_save, limits = await self.supabase.check_receipt_limit(callback.from_user.id)
-                if not can_save:
-                    receipts_count = limits.get("receipts_count", 0)
-                    limit_receipts = limits.get("limit_receipts", 10)
-                    await callback.message.answer(
-                        f"⚠️ Достигнут лимит пробного периода\n\n"
-                        f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
-                        f"Для продолжения распознавания чеков оформите подписку:\n"
-                        f"• 📦 Standard — 50 чеков/месяц за 100 ⭐\n"
-                        f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
-                        f"• 👑 Premium — безлимит за 500 ⭐\n\n"
-                        f"Используйте команду /subscribe для выбора тарифа.\n\n"
-                        f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
-                        f"• 📊 Получение отчетов (/report)\n"
-                        f"• 📥 Выгрузка данных в CSV (/export)\n"
-                        f"• ✏️ Добавление расходов вручную (/expense)"
-                    )
-                await state.clear()
-                return
-            
             try:
+                await callback.answer()
+                logging.info(f"✅ Получено подтверждение чека от user_id={callback.from_user.id if callback.from_user else 'unknown'}")
+                data = await state.get_data()
+                parsed_receipt = data.get("parsed_receipt")
+                receipt_payload = data.get("receipt_payload")
+                
+                logging.info(f"Данные из FSM state: parsed_receipt={bool(parsed_receipt)}, receipt_payload={bool(receipt_payload)}, keys={list(data.keys())}")
+                
+                if not receipt_payload or not callback.from_user:
+                    logging.warning(f"❌ Ошибка: данные чека не найдены в FSM state для user_id={callback.from_user.id if callback.from_user else 'unknown'}")
+                    await callback.message.answer("Ошибка: данные чека не найдены.")
+                    await state.clear()
+                    return
+                
+                if not callback.from_user:
+                    logging.warning(f"❌ Ошибка: не удалось определить пользователя")
+                    await callback.message.answer("Ошибка: не удалось определить пользователя.")
+                    await state.clear()
+                    return
+                
+                logging.info(f"✅ Все проверки пройдены, переходим к проверке лимита и сохранению")
+                # Проверяем лимит чеков перед сохранением
+                if self.supabase:
+                    logging.info(f"🔍 Проверка лимита чеков перед сохранением (user_id={callback.from_user.id})")
+                    can_save, limits = await self.supabase.check_receipt_limit(callback.from_user.id)
+                    logging.info(f"Результат проверки лимита: can_save={can_save}, limits={limits}")
+                    if not can_save:
+                        receipts_count = limits.get("receipts_count", 0)
+                        limit_receipts = limits.get("limit_receipts", 10)
+                        logging.warning(f"❌ Лимит чеков достигнут: {receipts_count}/{limit_receipts}")
+                        await callback.message.answer(
+                            f"⚠️ Достигнут лимит пробного периода\n\n"
+                            f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
+                            f"Для продолжения распознавания чеков оформите подписку:\n"
+                            f"• 📦 Standard — 50 чеков/месяц за 100 ⭐\n"
+                            f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
+                            f"• 👑 Premium — безлимит за 500 ⭐\n\n"
+                            f"Используйте команду /subscribe для выбора тарифа.\n\n"
+                            f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
+                            f"• 📊 Получение отчетов (/report)\n"
+                            f"• 📥 Выгрузка данных в CSV (/export)\n"
+                            f"• ✏️ Добавление расходов вручную (/expense)"
+                        )
+                        await state.clear()
+                        return
+                    logging.info(f"✅ Лимит не превышен, продолжаем сохранение")
+                else:
+                    logging.error(f"❌ self.supabase is None, невозможно сохранить чек")
+                    await callback.message.answer("⚠️ Ошибка: база данных недоступна")
+                    await state.clear()
+                    return
+                
+                logging.info(f"🔍 Начинаем проверку валидации суммы перед сохранением")
                 # Проверяем несоответствие суммы перед сохранением
                 if parsed_receipt:
+                    logging.info(f"parsed_receipt найден, проверяем сумму")
                     items_sum = sum(item.price for item in parsed_receipt.items)
                     total = parsed_receipt.total or 0.0
                     difference = abs(items_sum - total)
@@ -3519,6 +4155,11 @@ class ExpenseCatBot:
                         # Несоответствие суммы - не сохраняем, отправляем фото в rejected receipts
                         file_bytes = data.get("receipt_photo_bytes")
                         mime_type = data.get("receipt_photo_mime_type", "image/jpeg")
+                        
+                        # Формируем таблицу результатов калькуляции
+                        receipt_table = None
+                        if parsed_receipt:
+                            receipt_table = format_receipt_table(parsed_receipt)
                         
                         if file_bytes and self.supabase:
                             try:
@@ -3536,17 +4177,20 @@ class ExpenseCatBot:
                                         first_name=callback.from_user.first_name,
                                         reason="validation_error",
                                         file_path=file_path,
-                                        file_bytes=file_bytes,  # Отправляем фото напрямую
+                                        file_bytes=file_bytes if file_bytes and isinstance(file_bytes, bytes) and len(file_bytes) > 0 else None,  # Отправляем фото напрямую
                                         mime_type=mime_type,
-                                        error_message=f"Несоответствие суммы: позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}"
+                                        error_message=f"Несоответствие суммы: товаров={len(parsed_receipt.items)}, позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}",
+                                        receipt_table=receipt_table  # Добавляем результаты калькуляции
                                     )
                             except Exception as exc:
                                 logging.warning(f"Failed to save rejected receipt photo: {exc}")
                         
+                        items_count = len(parsed_receipt.items)
                         await callback.message.answer(
                             f"❌ Чек не сохранен из-за несоответствия суммы:\n"
-                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
-                            f"Итого: {total:.2f} {parsed_receipt.currency}\n"
+                            f"Товаров в чеке: {items_count}\n"
+                            f"Сумма всех позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                            f"Итого по чеку: {total:.2f} {parsed_receipt.currency}\n"
                             f"Разница: {difference:.2f} {parsed_receipt.currency}\n\n"
                             f"Пожалуйста, отправьте фото чека заново."
                         )
@@ -3554,7 +4198,17 @@ class ExpenseCatBot:
                         return
                 
                 # Сохраняем чек в базу
+                logging.info(f"💾 Начинаем сохранение чека в базу данных (user_id={callback.from_user.id}, store={receipt_payload.get('store')}, total={receipt_payload.get('total')})")
+                if not self.supabase:
+                    logging.error(f"❌ self.supabase is None, невозможно сохранить чек")
+                    await callback.message.answer("⚠️ Ошибка: база данных недоступна")
+                    await state.clear()
+                    return
+                save_start = time.perf_counter()
                 stored_receipt, is_duplicate = await self.supabase.upsert_receipt(receipt_payload)
+                save_time = time.perf_counter() - save_start
+                logging.info(f"⏱️ [PERF] Сохранение чека (handle_receipt_confirm): {save_time*1000:.1f}ms")
+                logging.info(f"Результат сохранения: stored_receipt={bool(stored_receipt)}, is_duplicate={is_duplicate}, receipt_id={stored_receipt.get('id') if stored_receipt else None}")
                 
                 # Проверяем, что получили реальную запись с id
                 if not stored_receipt or not stored_receipt.get("id"):
@@ -3566,8 +4220,11 @@ class ExpenseCatBot:
                     await callback.message.answer("⚠️ Этот чек уже был сохранен ранее (дубликат)")
                 else:
                     # Создаем expense запись из receipt только если это новый чек
+                    expense_start = time.perf_counter()
                     expense_payload = build_expense_payload_from_receipt(stored_receipt)
                     expense_result = await self.supabase.record_expense(expense_payload)
+                    expense_time = time.perf_counter() - expense_start
+                    logging.info(f"⏱️ [PERF] Создание expense записи: {expense_time*1000:.1f}ms")
                     if expense_result.get("duplicate"):
                         await callback.message.answer("✅ Чек сохранен в базу данных\n⚠️ Расход не создан: найден дубликат (возможно, уже есть в выписке)")
                     else:
@@ -3588,6 +4245,12 @@ class ExpenseCatBot:
                 data = await state.get_data()
                 file_bytes = data.get("receipt_photo_bytes")
                 mime_type = data.get("receipt_photo_mime_type", "image/jpeg")
+                parsed_receipt = data.get("parsed_receipt")
+                
+                # Формируем таблицу результатов калькуляции
+                receipt_table = None
+                if parsed_receipt:
+                    receipt_table = format_receipt_table(parsed_receipt)
                 
                 if file_bytes:
                     try:
@@ -3607,8 +4270,9 @@ class ExpenseCatBot:
                                     first_name=callback.from_user.first_name,
                                     reason="rejected_by_user",
                                     file_path=file_path,
-                                    file_bytes=file_bytes,  # Отправляем фото напрямую
-                                    mime_type=mime_type
+                                    file_bytes=file_bytes if file_bytes and isinstance(file_bytes, bytes) and len(file_bytes) > 0 else None,  # Отправляем фото напрямую
+                                    mime_type=mime_type,
+                                    receipt_table=receipt_table  # Добавляем результаты калькуляции
                                 )
                     except Exception as exc:
                         logging.warning(f"Failed to save rejected receipt photo: {exc}")
@@ -3842,9 +4506,15 @@ class ExpenseCatBot:
             await state.clear()
 
     async def _process_receipt_message(self, message: Message, state: FSMContext) -> None:
+        start_time = time.perf_counter()
+        logging.info(f"⏱️ [PERF] Начало обработки чека для user_id={message.from_user.id if message.from_user else 'unknown'}")
+        
         # Проверяем лимит чеков перед обработкой
+        limit_check_start = time.perf_counter()
         if self.supabase and message.from_user:
             can_save, limits = await self.supabase.check_receipt_limit(message.from_user.id)
+            limit_check_time = time.perf_counter() - limit_check_start
+            logging.info(f"⏱️ [PERF] Проверка лимита: {limit_check_time*1000:.1f}ms")
             if not can_save:
                 receipts_count = limits.get("receipts_count", 0)
                 limit_receipts = limits.get("limit_receipts", 10)
@@ -3860,25 +4530,20 @@ class ExpenseCatBot:
                     f"• 📥 Выгрузка данных в CSV (/export)\n"
                     f"• ✏️ Добавление расходов вручную (/expense)"
                 )
+                total_time = time.perf_counter() - start_time
+                logging.info(f"⏱️ [PERF] Обработка чека завершена (лимит): {total_time*1000:.1f}ms")
                 return
         
-        await message.answer("Чек принят, распознаю…")
+        await message.answer("🔍 Распознаю...")
         
-        # Сохраняем оригинальное фото для возможного сохранения при отклонении
-        file = await self._resolve_file(message)
-        file_bytes_for_storage = None
-        mime_type_for_storage = None
-        if file:
-            mime_type_for_storage = detect_mime_type(message, file.file_path)
-            file_bytes_for_storage = await self._download_file(file.file_path)
-            try:
-                file_bytes_for_storage, mime_type_for_storage = convert_heic_if_needed(
-                    file_bytes_for_storage, mime_type_for_storage
-                )
-            except:
-                pass
-        
+        receipt_processing_start = time.perf_counter()
         result = await self._handle_receipt_from_message(message)
+        
+        # Используем file_bytes из результата, чтобы не загружать файл дважды
+        file_bytes_for_storage = result.file_bytes
+        mime_type_for_storage = result.mime_type
+        receipt_processing_time = time.perf_counter() - receipt_processing_start
+        logging.info(f"⏱️ [PERF] Обработка чека (_handle_receipt_from_message): {receipt_processing_time*1000:.1f}ms")
         logging.info(f"Receipt processing result: success={result.success}, has_summary={bool(result.summary)}, has_error={bool(result.error)}")
         
         # Если была ошибка валидации, сохраняем фото
@@ -3890,6 +4555,11 @@ class ExpenseCatBot:
                     reason="validation_error",
                     mime_type=mime_type_for_storage or "image/jpeg"
                 )
+                # Формируем таблицу результатов калькуляции, если есть распознанные данные
+                receipt_table = None
+                if result.parsed_receipt:
+                    receipt_table = format_receipt_table(result.parsed_receipt)
+                
                 # Отправляем информацию о фейле в канал
                 if file_path and self.failed_receipts_chat_id:
                     await self._send_failed_receipt_to_channel(
@@ -3898,9 +4568,10 @@ class ExpenseCatBot:
                         first_name=message.from_user.first_name,
                         reason="validation_error",
                         file_path=file_path,
-                        file_bytes=file_bytes_for_storage,  # Отправляем фото напрямую
+                        file_bytes=file_bytes_for_storage if file_bytes_for_storage and isinstance(file_bytes_for_storage, bytes) and len(file_bytes_for_storage) > 0 else None,  # Отправляем фото напрямую
                         mime_type=mime_type_for_storage or "image/jpeg",
-                        error_message=result.error
+                        error_message=result.error,
+                        receipt_table=receipt_table  # Добавляем результаты калькуляции
                     )
             except Exception as exc:
                 logging.warning(f"Failed to save rejected receipt photo: {exc}")
@@ -3914,8 +4585,10 @@ class ExpenseCatBot:
                 difference = abs(items_sum - total)
                 tolerance = max(total * 0.01, 1.0)
                 validation_passed = difference <= tolerance
+                logging.info(f"🔍 Валидация суммы: разница={difference:.2f}, tolerance={tolerance:.2f}, пройдена={validation_passed}")
             
             if not validation_passed:
+                logging.warning(f"❌ Валидация не пройдена, чек не будет сохранен")
                 # Если валидация не пройдена, сохраняем фото и отправляем уведомление в канал
                 if file_bytes_for_storage and self.supabase and message.from_user:
                     try:
@@ -3925,6 +4598,11 @@ class ExpenseCatBot:
                             reason="validation_error",
                             mime_type=mime_type_for_storage or "image/jpeg"
                         )
+                        # Формируем таблицу результатов калькуляции
+                        receipt_table = None
+                        if result.parsed_receipt:
+                            receipt_table = format_receipt_table(result.parsed_receipt)
+                        
                         # Отправляем информацию о фейле в канал
                         if file_path:
                             logging.info(f"Rejected receipt photo saved: {file_path}")
@@ -3932,7 +4610,8 @@ class ExpenseCatBot:
                                 items_sum = sum(item.price for item in result.parsed_receipt.items)
                                 total = result.parsed_receipt.total or 0.0
                                 difference = abs(items_sum - total)
-                                error_text = f"Несоответствие суммы: позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}"
+                                items_count = len(result.parsed_receipt.items)
+                                error_text = f"Несоответствие суммы: товаров={items_count}, позиции={items_sum:.2f}, итого={total:.2f}, разница={difference:.2f}"
                                 if result.qr_url_found_but_failed:
                                     error_text += " | Не удалось получить данные по QR-коду"
                                 logging.info(f"Sending failed receipt notification to channel: {self.failed_receipts_chat_id}")
@@ -3942,9 +4621,10 @@ class ExpenseCatBot:
                                     first_name=message.from_user.first_name,
                                     reason="validation_error",
                                     file_path=file_path,
-                                    file_bytes=file_bytes_for_storage,  # Отправляем фото напрямую
+                                    file_bytes=file_bytes_for_storage if file_bytes_for_storage and isinstance(file_bytes_for_storage, bytes) and len(file_bytes_for_storage) > 0 else None,  # Отправляем фото напрямую
                                     mime_type=mime_type_for_storage or "image/jpeg",
-                                    error_message=error_text
+                                    error_message=error_text,
+                                    receipt_table=receipt_table  # Добавляем результаты калькуляции
                                 )
                             else:
                                 logging.warning("failed_receipts_chat_id not configured, skipping channel notification")
@@ -3971,6 +4651,7 @@ class ExpenseCatBot:
             
             # Сохраняем данные чека в FSM для подтверждения (только если валидация пройдена)
             if result.parsed_receipt and result.receipt_payload:
+                logging.info(f"💾 Сохранение данных чека в FSM state (user_id={message.from_user.id if message.from_user else 'unknown'}, store={result.parsed_receipt.store}, total={result.parsed_receipt.total})")
                 await state.update_data(
                     parsed_receipt=result.parsed_receipt,
                     receipt_payload=result.receipt_payload,
@@ -3978,32 +4659,46 @@ class ExpenseCatBot:
                     receipt_photo_mime_type=mime_type_for_storage or "image/jpeg",
                 )
                 await state.set_state(ReceiptStates.waiting_for_confirmation)
-            
-            # Создаем кнопки для подтверждения (в разных рядах)
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Все верно", callback_data="receipt_confirm"),
-                ],
-                [
-                    InlineKeyboardButton(text="❌ Есть ошибка (переснять)", callback_data="receipt_reject"),
-                ]
-            ])
+                logging.info(f"✅ Данные чека сохранены в FSM, состояние установлено: ReceiptStates.waiting_for_confirmation")
+                
+                # Создаем кнопки для подтверждения только если данные успешно сохранены в FSM
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Все верно", callback_data="receipt_confirm"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="❌ Есть ошибка (переснять)", callback_data="receipt_reject"),
+                    ]
+                ])
+            else:
+                logging.warning(f"⚠️ Не удалось сохранить данные в FSM: parsed_receipt={bool(result.parsed_receipt)}, receipt_payload={bool(result.receipt_payload)}")
+                # Не создаем кнопки, если данные не сохранены
+                keyboard = None
             
             # Генерируем и отправляем изображение (валидация уже пройдена)
             if result.parsed_receipt:
+                img_start = time.perf_counter()
                 img_bytes = generate_receipt_image(result.parsed_receipt)
+                img_time = time.perf_counter() - img_start
+                if img_time > 0.1:
+                    logging.info(f"⏱️ [PERF] Генерация изображения чека: {img_time*1000:.1f}ms")
+                
                 if img_bytes:
                     # Отправляем изображение
+                    logging.info(f"Отправка изображения чека с кнопками подтверждения (user_id={message.from_user.id if message.from_user else 'unknown'})")
                     photo = BufferedInputFile(img_bytes, filename="receipt.png")
-                    await message.answer_photo(photo, reply_markup=keyboard)
+                    await message.answer_photo(photo, reply_markup=keyboard if keyboard else None)
+                    logging.info(f"✅ Изображение чека отправлено, ожидаем подтверждения от пользователя")
                     
                     # Отправляем результат валидации отдельным сообщением
                     items_sum = sum(item.price for item in result.parsed_receipt.items)
                     total = result.parsed_receipt.total or 0.0
+                    items_count = len(result.parsed_receipt.items)
                     validation_text = (
                         f"✅ Валидация пройдена:\n"
-                        f"Сумма позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
-                        f"Итого: {total:.2f} {result.parsed_receipt.currency}"
+                        f"Товаров в чеке: {items_count}\n"
+                        f"Сумма всех позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
+                        f"Итого по чеку: {total:.2f} {result.parsed_receipt.currency}"
                     )
                     await message.answer(validation_text)
                     
@@ -4017,12 +4712,27 @@ class ExpenseCatBot:
                     
                     if additional_info:
                         await message.answer(additional_info.strip())
+                    
+                    total_time = time.perf_counter() - start_time
+                    logging.info(f"⏱️ [PERF] _process_receipt_message всего: {total_time*1000:.1f}ms ({total_time:.2f}s)")
                     return
             
             # Fallback: отправляем текстом если не удалось сгенерировать изображение
-            truncated_summary = truncate_message_for_telegram(result.summary)
-            logging.info(f"Sending receipt summary to user (text fallback): {len(result.summary)} chars")
-            await message.answer(truncated_summary, reply_markup=keyboard)
+            # Кнопки показываем только если они были созданы (данные успешно сохранены в FSM)
+            if keyboard:
+                logging.info(f"Fallback: отправка текстового сообщения с кнопками (user_id={message.from_user.id if message.from_user else 'unknown'})")
+                truncated_summary = truncate_message_for_telegram(result.summary)
+                logging.info(f"Sending receipt summary to user (text fallback): {len(result.summary)} chars")
+                await message.answer(truncated_summary, reply_markup=keyboard)
+                logging.info(f"✅ Текстовое сообщение с кнопками отправлено, ожидаем подтверждения от пользователя")
+            else:
+                # Если кнопки не созданы, отправляем только текст без кнопок
+                logging.info(f"Fallback: отправка текстового сообщения без кнопок (данные не сохранены в FSM)")
+                truncated_summary = truncate_message_for_telegram(result.summary)
+                await message.answer(truncated_summary)
+            
+            total_time = time.perf_counter() - start_time
+            logging.info(f"⏱️ [PERF] _process_receipt_message всего: {total_time*1000:.1f}ms ({total_time:.2f}s)")
             return
         error_msg = result.error or "Не удалось обработать чек."
         logging.warning(f"Sending error to user: {error_msg}")
@@ -4038,18 +4748,50 @@ class ExpenseCatBot:
         await message.answer(result.error or "Не удалось обработать выписку.")
 
     async def _handle_receipt_from_message(self, message: Message) -> ProcessingResult:
+        start_time = time.perf_counter()
+        
+        file_load_start = time.perf_counter()
         file = await self._resolve_file(message)
         if file is None:
-            return ProcessingResult(success=False, error="Не удалось прочитать файл.")
+            # Сохраняем статистику неуспешного распознавания (файл не прочитан)
+            if self.supabase and message.from_user:
+                try:
+                    await self.supabase.save_receipt_recognition_stat(
+                        user_id=message.from_user.id,
+                        recognition_method="unknown",  # Файл не прочитан, метод не определен
+                        success=False,
+                        error_message="Не удалось прочитать файл"
+                    )
+                except Exception as stat_exc:
+                    logging.warning(f"Failed to save recognition stat: {stat_exc}")
+            return ProcessingResult(success=False, error="Не удалось прочитать файл.", recognition_method="unknown")
         mime_type = detect_mime_type(message, file.file_path)
         file_bytes = await self._download_file(file.file_path)
+        
+        # Сохраняем оригинальные байты для возможного сохранения при отклонении
+        file_bytes_for_storage = file_bytes
+        mime_type_for_storage = mime_type
+        
+        file_load_time = time.perf_counter() - file_load_start
+        logging.info(f"⏱️ [PERF] Загрузка файла в _handle_receipt_from_message: {file_load_time*1000:.1f}ms")
+        
         try:
+            convert_start = time.perf_counter()
             file_bytes, mime_type = convert_heic_if_needed(file_bytes, mime_type)
+            # Обновляем file_bytes_for_storage после конвертации
+            file_bytes_for_storage = file_bytes
+            mime_type_for_storage = mime_type
+            convert_time = time.perf_counter() - convert_start
+            if convert_time > 0.1:
+                logging.info(f"⏱️ [PERF] Конвертация HEIC в _handle_receipt_from_message: {convert_time*1000:.1f}ms")
         except ReceiptParsingError as exc:
-            return ProcessingResult(success=False, error=str(exc))
+            return ProcessingResult(success=False, error=str(exc), file_bytes=file_bytes_for_storage, mime_type=mime_type_for_storage)
+        
         # Сначала проверяем QR-коды
+        qr_start = time.perf_counter()
         qr_codes = read_qr_codes(file_bytes)
-        logging.info(f"Найдено QR-кодов: {len(qr_codes)}")
+        qr_time = time.perf_counter() - qr_start
+        logging.info(f"⏱️ [PERF] Чтение QR-кодов: {qr_time*1000:.1f}ms, найдено: {len(qr_codes)}")
         
         # Переменная для хранения данных из QR-кода для отправки в OpenAI
         qr_data_from_url = None
@@ -4073,7 +4815,10 @@ class ExpenseCatBot:
                 if is_url(qr_data):
                     logging.info(f"✅ Найден код с URL (тип: {qr_type}): {qr_data}")
                     # Пытаемся получить данные с URL
+                    qr_fetch_start = time.perf_counter()
                     qr_data_from_url = await fetch_receipt_from_qr_url(qr_data)
+                    qr_fetch_time = time.perf_counter() - qr_fetch_start
+                    logging.info(f"⏱️ [PERF] Получение данных с QR URL: {qr_fetch_time*1000:.1f}ms")
                     if qr_data_from_url:
                         logging.info(f"✅ Получены данные с URL, отправляем их в OpenAI для структурирования")
                     else:
@@ -4100,18 +4845,40 @@ class ExpenseCatBot:
             else:
                 mime_type = "image/jpeg"
             
-            # Отправляем в OpenAI (с данными из QR-кода, если есть, иначе с изображением)
+            # Определяем способ распознавания для статистики
+            # Проверяем, содержат ли данные из QR-кода позиции товаров
+            use_qr_data = False
             if qr_data_from_url:
-                logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
+                items_in_qr = qr_data_from_url.get("items") or []
+                # Используем данные из QR-кода только если там есть реальные позиции товаров
+                if items_in_qr and not (len(items_in_qr) == 1 and items_in_qr[0].get("name") in ["Без позиций", "Покупка"]):
+                    use_qr_data = True
+                    recognition_method = "openai_qr_data"
+                else:
+                    logging.warning(f"⚠️ Данные из QR-кода не содержат позиций товаров, используем изображение для распознавания")
+                    recognition_method = "openai_photo"
+            else:
+                recognition_method = "openai_photo"
+            
+            # Отправляем в OpenAI (с данными из QR-кода, если есть реальные позиции, иначе с изображением)
+            openai_start = time.perf_counter()
+            if use_qr_data:
+                logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования (найдено {len(items_in_qr)} позиций)")
                 response_json = await parse_receipt_with_ai(file_bytes, mime_type, qr_data=qr_data_from_url)
             else:
-                logging.info("Starting OpenAI receipt parsing...")
+                logging.info("Starting OpenAI receipt parsing from image...")
                 response_json = await parse_receipt_with_ai(file_bytes, mime_type)
+            openai_time = time.perf_counter() - openai_start
+            logging.info(f"⏱️ [PERF] OpenAI запрос: {openai_time*1000:.1f}ms ({openai_time:.2f}s)")
             
             # Увеличиваем счетчик чеков после успешного запроса в OpenAI
             # (независимо от того, дубликат это или нет, так как запрос в OpenAI уже оплачен)
             if self.supabase and message.from_user:
+                increment_start = time.perf_counter()
                 await self.supabase.increment_receipt_count(message.from_user.id)
+                increment_time = time.perf_counter() - increment_start
+                if increment_time > 0.1:
+                    logging.info(f"⏱️ [PERF] Увеличение счетчика чеков: {increment_time*1000:.1f}ms")
             
             # Извлекаем только content из message и информацию о токенах
             try:
@@ -4127,12 +4894,14 @@ class ExpenseCatBot:
                 if refusal:
                     refusal_msg = f"OpenAI отказался обрабатывать запрос: {refusal}"
                     logging.warning(refusal_msg)
-                    raise ReceiptParsingError(refusal_msg)
+                    # Используем специальный код ошибки для refusal, чтобы показать пользователю дружелюбное сообщение
+                    raise ReceiptParsingError("REFUSAL: Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз или убедитесь, что на фото четко виден кассовый чек.")
                 
                 if not content:
                     raise ReceiptParsingError("OpenAI response не содержит content")
                 
                 # Парсим JSON из content
+                parse_start = time.perf_counter()
                 content_json = None
                 try:
                     # Парсим JSON из content
@@ -4145,15 +4914,34 @@ class ExpenseCatBot:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         logging.warning("Не удалось распарсить JSON из content")
                         raise ReceiptParsingError("Не удалось распарсить ответ от OpenAI")
+                parse_time = time.perf_counter() - parse_start
+                if parse_time > 0.01:
+                    logging.info(f"⏱️ [PERF] Парсинг JSON: {parse_time*1000:.1f}ms")
                 
                 # Преобразуем в ParsedReceipt для форматирования
+                build_start = time.perf_counter()
                 parsed_receipt = build_parsed_receipt(content_json)
+                build_time = time.perf_counter() - build_start
+                if build_time > 0.01:
+                    logging.info(f"⏱️ [PERF] Построение ParsedReceipt: {build_time*1000:.1f}ms")
                 
                 # Логируем категории из OpenAI ответа
                 items_from_ai = content_json.get("items", [])
                 categories_from_ai = {}
                 items_with_cat = 0
                 items_without_cat = 0
+                # Проверяем наличие дубликатов в ответе OpenAI
+                item_names = [item.get("name", "") for item in items_from_ai if isinstance(item, dict)]
+                duplicates = {}
+                for i, name in enumerate(item_names):
+                    if name in duplicates:
+                        duplicates[name].append(i)
+                    else:
+                        duplicates[name] = [i]
+                duplicate_items = {name: indices for name, indices in duplicates.items() if len(indices) > 1}
+                if duplicate_items:
+                    logging.warning(f"⚠️ Найдены дубликаты позиций в ответе OpenAI: {duplicate_items}")
+                
                 for item in items_from_ai:
                     if isinstance(item, dict):
                         cat = item.get("category")
@@ -4165,9 +4953,18 @@ class ExpenseCatBot:
                 logging.info(f"Категории из OpenAI ответа: всего items={len(items_from_ai)}, с категорией={items_with_cat}, без категории={items_without_cat}, категории={categories_from_ai}")
                 
                 # Проверяем правильность распознавания: сумма позиций должна совпадать с тоталом
+                # ВАЖНО: используем все позиции из parsed_receipt.items, включая дубликаты
                 items_sum = sum(item.price for item in parsed_receipt.items)
                 total = parsed_receipt.total or 0.0
                 difference = abs(items_sum - total)
+                
+                # Логируем информацию о позициях для диагностики
+                logging.info(f"📊 Валидация суммы: items_count={len(parsed_receipt.items)}, items_from_ai_count={len(items_from_ai)}, items_sum={items_sum:.2f}, total={total:.2f}, difference={difference:.2f}")
+                if len(parsed_receipt.items) != len(items_from_ai):
+                    logging.warning(f"⚠️ Количество позиций изменилось: было {len(items_from_ai)}, стало {len(parsed_receipt.items)}")
+                    # Логируем все позиции для сравнения
+                    logging.info(f"Позиции из OpenAI: {[item.get('name', '') for item in items_from_ai if isinstance(item, dict)]}")
+                    logging.info(f"Позиции в parsed_receipt: {[item.name for item in parsed_receipt.items]}")
                 
                 # Допускаем погрешность до 1% или 1 единицу валюты (что больше)
                 tolerance = max(total * 0.01, 1.0)
@@ -4249,10 +5046,28 @@ class ExpenseCatBot:
                 if self.supabase and message.from_user:
                     try:
                         # Создаем payload для базы
+                        payload_start = time.perf_counter()
                         receipt_payload = build_receipt_payload(message.from_user.id, parsed_receipt)
+                        payload_time = time.perf_counter() - payload_start
+                        if payload_time > 0.01:
+                            logging.info(f"⏱️ [PERF] Создание payload: {payload_time*1000:.1f}ms")
                         logging.info(f"Создан payload для сохранения: store={receipt_payload.get('store')}, total={receipt_payload.get('total')}")
                     except Exception as db_exc:
                         logging.exception(f"Ошибка при создании payload: {db_exc}")
+                
+                total_time = time.perf_counter() - start_time
+                logging.info(f"⏱️ [PERF] _handle_receipt_from_message всего: {total_time*1000:.1f}ms ({total_time:.2f}s)")
+                
+                # Сохраняем статистику успешного распознавания
+                if self.supabase and message.from_user:
+                    try:
+                        await self.supabase.save_receipt_recognition_stat(
+                            user_id=message.from_user.id,
+                            recognition_method=recognition_method,
+                            success=True
+                        )
+                    except Exception as stat_exc:
+                        logging.warning(f"Failed to save recognition stat: {stat_exc}")
                 
                 return ProcessingResult(
                     success=True,
@@ -4260,6 +5075,9 @@ class ExpenseCatBot:
                     parsed_receipt=parsed_receipt,
                     receipt_payload=receipt_payload,
                     qr_url_found_but_failed=qr_url_found_but_failed,
+                    file_bytes=file_bytes_for_storage,
+                    mime_type=mime_type_for_storage,
+                    recognition_method=recognition_method,
                 )
             except Exception as exc:
                 logging.error(f"Error extracting content: {exc}", exc_info=True)
@@ -4285,23 +5103,26 @@ class ExpenseCatBot:
                                     difference = abs(items_sum - total)
                                     tolerance = max(total * 0.01, 1.0)
                                     
+                                    items_count = len(parsed_receipt.items)
                                     validation_message = ""
                                     if difference > tolerance:
                                         validation_message = (
                                             f"\n\n⚠️ Несоответствие суммы:\n"
-                                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
-                                            f"Итого: {total:.2f} {parsed_receipt.currency}\n"
+                                            f"Товаров в чеке: {items_count}\n"
+                                            f"Сумма всех позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                                            f"Итого по чеку: {total:.2f} {parsed_receipt.currency}\n"
                                             f"Разница: {difference:.2f} {parsed_receipt.currency}"
                                         )
                                         logging.warning(
-                                            f"⚠️ Несоответствие суммы (fallback): сумма позиций={items_sum:.2f}, "
+                                            f"⚠️ Несоответствие суммы (fallback): товаров={items_count}, сумма позиций={items_sum:.2f}, "
                                             f"итого={total:.2f}, разница={difference:.2f}"
                                         )
                                     else:
                                         validation_message = (
                                             f"\n\n✅ Валидация пройдена:\n"
-                                            f"Сумма позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
-                                            f"Итого: {total:.2f} {parsed_receipt.currency}"
+                                            f"Товаров в чеке: {items_count}\n"
+                                            f"Сумма всех позиций: {items_sum:.2f} {parsed_receipt.currency}\n"
+                                            f"Итого по чеку: {total:.2f} {parsed_receipt.currency}"
                                         )
                                     
                                     # Форматируем в таблицу
@@ -4316,36 +5137,136 @@ class ExpenseCatBot:
                                         except Exception as payload_exc:
                                             logging.exception(f"Ошибка при создании payload (fallback): {payload_exc}")
                                     
+                                    # Сохраняем статистику успешного распознавания (fallback)
+                                    if self.supabase and message.from_user:
+                                        try:
+                                            await self.supabase.save_receipt_recognition_stat(
+                                                user_id=message.from_user.id,
+                                                recognition_method=recognition_method,
+                                                success=True
+                                            )
+                                        except Exception as stat_exc:
+                                            logging.warning(f"Failed to save recognition stat: {stat_exc}")
+                                    
                                     return ProcessingResult(
                                         success=True,
                                         summary=response_str,
                                         parsed_receipt=parsed_receipt,
                                         receipt_payload=receipt_payload,
                                         qr_url_found_but_failed=qr_url_found_but_failed,
+                                        file_bytes=file_bytes_for_storage,
+                                        mime_type=mime_type_for_storage,
+                                        recognition_method=recognition_method,
                                     )
                                 except Exception as fallback_exc:
                                     logging.exception(f"Ошибка при парсинге в fallback: {fallback_exc}")
-                                    # Если не удалось распарсить, показываем JSON
-                                    response_str = json.dumps(response_json, ensure_ascii=False, indent=2)
+                                    # Если не удалось распарсить, проверяем наличие refusal
+                                    choices = response_json.get("choices", [])
+                                    has_refusal = False
+                                    if choices:
+                                        ai_message = choices[0].get("message", {})
+                                        if ai_message.get("refusal"):
+                                            has_refusal = True
+                                    
+                                    if has_refusal:
+                                        response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз или убедитесь, что на фото четко виден кассовый чек."
+                                    else:
+                                        response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз."
                     except Exception as db_exc:
                         logging.exception(f"Ошибка при сохранении в базу (fallback): {db_exc}")
                         if not response_str:
-                            response_str = json.dumps(response_json, ensure_ascii=False, indent=2)
+                            # Проверяем наличие refusal
+                            choices = response_json.get("choices", [])
+                            has_refusal = False
+                            if choices:
+                                ai_message = choices[0].get("message", {})
+                                if ai_message.get("refusal"):
+                                    has_refusal = True
+                            
+                            if has_refusal:
+                                response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз или убедитесь, что на фото четко виден кассовый чек."
+                            else:
+                                response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз."
                 
                 if not response_str:
-                    response_str = f"Ошибка обработки: {exc}\n\nПолный ответ:\n{json.dumps(response_json, ensure_ascii=False, indent=2)}"
+                    # Проверяем, есть ли refusal в ответе OpenAI
+                    choices = response_json.get("choices", [])
+                    has_refusal = False
+                    if choices:
+                        ai_message = choices[0].get("message", {})
+                        if ai_message.get("refusal"):
+                            has_refusal = True
+                    
+                    if has_refusal:
+                        # Показываем дружелюбное сообщение без технических деталей
+                        response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз или убедитесь, что на фото четко виден кассовый чек."
+                    else:
+                        # Для других ошибок показываем общее сообщение без технических деталей
+                        response_str = "Не удалось распознать чек. Пожалуйста, попробуйте отправить фото чека еще раз."
+                
+                # Сохраняем статистику успешного распознавания (с ошибкой парсинга, но OpenAI ответил)
+                if self.supabase and message.from_user:
+                    try:
+                        await self.supabase.save_receipt_recognition_stat(
+                            user_id=message.from_user.id,
+                            recognition_method=recognition_method,
+                            success=True  # OpenAI ответил, даже если парсинг не удался
+                        )
+                    except Exception as stat_exc:
+                        logging.warning(f"Failed to save recognition stat: {stat_exc}")
                 
                 return ProcessingResult(
                     success=True,
                     summary=response_str,
                     qr_url_found_but_failed=qr_url_found_but_failed,
+                    file_bytes=file_bytes_for_storage,
+                    mime_type=mime_type_for_storage,
+                    recognition_method=recognition_method,
                 )
         except ReceiptParsingError as exc:
             logging.exception("Receipt parsing failed")
-            return ProcessingResult(success=False, error=f"Не удалось распознать чек: {exc}")
+            error_msg = str(exc)
+            
+            # Преобразуем технические ошибки в понятные сообщения для пользователя
+            user_error = format_user_friendly_error(exc)
+            
+            # Если это специальное сообщение для пользователя (начинается с "REFUSAL:"), показываем его без префикса
+            if error_msg.startswith("REFUSAL: "):
+                user_error = error_msg.replace("REFUSAL: ", "")
+            
+            # Сохраняем статистику неуспешного распознавания
+            if self.supabase and message.from_user:
+                try:
+                    await self.supabase.save_receipt_recognition_stat(
+                        user_id=message.from_user.id,
+                        recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo",
+                        success=False,
+                        error_message=error_msg[:500]  # Сохраняем оригинальное техническое сообщение для логов
+                    )
+                except Exception as stat_exc:
+                    logging.warning(f"Failed to save recognition stat: {stat_exc}")
+            
+            return ProcessingResult(success=False, error=user_error, file_bytes=file_bytes_for_storage, mime_type=mime_type_for_storage, recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo")
         except Exception as exc:
             logging.exception("Image preprocessing or parsing failed")
-            return ProcessingResult(success=False, error=f"Ошибка обработки изображения: {exc}")
+            error_msg = str(exc)
+            
+            # Преобразуем технические ошибки в понятные сообщения для пользователя
+            user_error = format_user_friendly_error(exc)
+            
+            # Сохраняем статистику неуспешного распознавания
+            if self.supabase and message.from_user:
+                try:
+                    await self.supabase.save_receipt_recognition_stat(
+                        user_id=message.from_user.id,
+                        recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo",
+                        success=False,
+                        error_message=error_msg[:500]  # Сохраняем оригинальное техническое сообщение для логов
+                    )
+                except Exception as stat_exc:
+                    logging.warning(f"Failed to save recognition stat: {stat_exc}")
+            
+            return ProcessingResult(success=False, error=user_error, file_bytes=file_bytes_for_storage, mime_type=mime_type_for_storage, recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo")
 
     async def _handle_statement_from_message(self, message: Message) -> ProcessingResult:
         file = await self._resolve_file(message)
@@ -4592,6 +5513,14 @@ def format_receipt_table(parsed: ParsedReceipt) -> str:
     lines.append("-" * (name_width + qty_width + price_width + 4))
     total_str = f"{parsed.total:.2f} {parsed.currency}"
     lines.append(f"{'ИТОГО':<{name_width}} {'':>{qty_width}} {total_str:>{price_width}}")
+    
+    # Добавляем информацию о количестве товаров
+    items_count = len(parsed.items)
+    if items_count > 0:
+        items_sum = sum(item.price for item in parsed.items)
+        lines.append("")
+        lines.append(f"Всего товаров: {items_count}")
+        lines.append(f"Сумма всех позиций: {items_sum:.2f} {parsed.currency}")
     
     # Оборачиваем в код-блок для моноширинного шрифта
     table_text = "\n".join(lines)
@@ -7831,46 +8760,108 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
             if not price_elem:
                 continue
             
+            # Удаляем теги <b>, <small> и другие, которые могут содержать лишние числа (например, скидки, номера)
+            # Копируем элемент и удаляем ненужные теги
+            from bs4 import BeautifulSoup
+            price_elem_str = str(price_elem)
+            price_elem_clean = BeautifulSoup(price_elem_str, 'html.parser')
+            for tag in price_elem_clean.find_all(['b', 'small', 'span']):
+                # Удаляем только если содержимое - это маленькое число (вероятно скидка или номер)
+                tag_text = tag.get_text(strip=True)
+                if tag_text.isdigit() and int(tag_text) < 10:
+                    tag.decompose()
+            
             # Получаем весь текст элемента, включая пробелы
-            price_text = price_elem.get_text(separator=' ', strip=False)
+            price_text = price_elem_clean.get_text(separator=' ', strip=False)
             # Убираем лишние пробелы, но сохраняем структуру
             price_text = ' '.join(price_text.split())
+            # Удаляем ведущие нули перед числами (например, "0 15.00" -> "15.00")
+            # Но только если это не часть числа (например, "0.15" остается как есть)
+            price_text = re.sub(r'\b0\s+(\d+\.?\d*)', r'\1', price_text)
             
-            logging.debug(f"Parsing price text: '{price_text}'")
+            logging.info(f"🔍 Parsing price text: '{price_text}'")
             
             # Ищем итоговую цену после знака "=" (формат: "= 13 299.00" или "=13299.00")
+            # Это самый надежный способ - итоговая цена всегда после "="
             total_price_match = re.search(r'=\s*([\d\s]+\.?\d*)', price_text)
             if total_price_match:
                 total_price_str = total_price_match.group(1).replace(' ', '')
-                total_price = float(total_price_str)
+                try:
+                    total_price = float(total_price_str)
+                    logging.info(f"✅ Найдена итоговая цена: {total_price}")
+                except ValueError:
+                    logging.warning(f"Could not parse total price from: '{total_price_str}'")
+                    continue
                 
-                # Ищем количество и цену за единицу (формат: "13 299.00 x 1" или "13299.00 x 1")
-                # Ищем паттерн: число с пробелами, затем x, затем число
-                qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+\.?\d*)', price_text)
-            if qty_price_match:
+                # Ищем количество и цену за единицу (формат: "415.00 x 1" или "13 299.00 x 1")
+                # Ищем паттерн: число с пробелами (может быть с точкой), затем x, затем число
+                # Важно: ищем паттерн ДО знака "=", чтобы не перепутать с итоговой суммой
+                price_before_equals = price_text.split('=')[0] if '=' in price_text else price_text
+                logging.info(f"🔍 Текст до знака '=': '{price_before_equals}'")
+                # Улучшенный паттерн: ищем "цена x количество", где количество - целое число без точки
+                # Игнорируем числа после количества (например, "15.00 x 2 1" -> берем "2", игнорируем "1")
+                # Паттерн: число с точкой (может быть с пробелами для тысяч), затем x, затем целое число
+                # Сначала пробуем строгий паттерн: цена с точкой, количество до пробела или конца строки
+                qty_price_match = re.search(r'([\d\s]+\.\d+)\s*[xX×]\s*(\d+)(?:\s|$)', price_before_equals)
+                if not qty_price_match:
+                    # Пробуем более гибкий паттерн без обязательного пробела после количества
+                    qty_price_match = re.search(r'([\d\s]+\.\d+)\s*[xX×]\s*(\d+)', price_before_equals)
+                
+                if qty_price_match:
                     unit_price_str = qty_price_match.group(1).replace(' ', '')
-                    quantity_str = qty_price_match.group(2)
-                    unit_price = float(unit_price_str)
-                    quantity = float(quantity_str)
-                    # Проверяем, что total_price соответствует unit_price * quantity
-                    expected_total = unit_price * quantity
-                    if abs(total_price - expected_total) > 0.01:
-                        # Используем вычисленное значение, если оно отличается
-                        total_price = expected_total
-            else:
+                    quantity_str = qty_price_match.group(2)  # Берем только первое число после "x"
+                    logging.info(f"🔍 Найден паттерн 'цена x количество': unit_price_str='{unit_price_str}', quantity_str='{quantity_str}'")
+                    try:
+                        unit_price = float(unit_price_str)
+                        quantity = float(quantity_str)
+                        logging.info(f"✅ Распарсено: unit_price={unit_price}, quantity={quantity}")
+                        # Проверяем, что total_price соответствует unit_price * quantity
+                        expected_total = unit_price * quantity
+                        if abs(total_price - expected_total) > 0.01:
+                            # Используем вычисленное значение, если оно отличается
+                            logging.warning(f"⚠️ Price mismatch: unit_price={unit_price}, quantity={quantity}, expected={expected_total}, got={total_price}")
+                            total_price = expected_total
+                        logging.info(f"✅ Финальные значения: unit_price={unit_price}, quantity={quantity}, total={total_price}")
+                    except ValueError:
+                        logging.warning(f"Could not parse unit price or quantity from: '{unit_price_str}', '{quantity_str}'")
+                        quantity = 1.0
+                        unit_price = total_price
+                else:
                     # Если не нашли количество, предполагаем quantity = 1
+                    logging.warning(f"⚠️ Не найден паттерн 'цена x количество' в тексте: '{price_before_equals}'")
                     quantity = 1.0
                     unit_price = total_price
+                    logging.info(f"✅ Используем значения по умолчанию: quantity={quantity}, unit_price={unit_price}, total={total_price}")
+            else:
+                # Если не нашли "=", пытаемся найти цену другим способом
+                # Ищем паттерн с "x" для количества
+                # Улучшенный паттерн: игнорируем числа после количества (например, "15.00 x 2 1" -> берем "2")
+                qty_price_match = re.search(r'([\d\s]+\.?\d*)\s*[xX×]\s*(\d+)(?:\s+\d+)*', price_text)
+                if qty_price_match:
+                    unit_price_str = qty_price_match.group(1).replace(' ', '')
+                    quantity_str = qty_price_match.group(2)  # Берем только первое число после "x"
+                    try:
+                        unit_price = float(unit_price_str)
+                        quantity = float(quantity_str)
+                        total_price = unit_price * quantity
+                        logging.debug(f"Parsed (no =): unit_price={unit_price}, quantity={quantity}, total={total_price}")
+                    except ValueError:
+                        logging.warning(f"Could not parse price from text: '{price_text}'")
+                        continue
+                else:
                     # Ищем просто большое число (цена с пробелами)
                     # Ищем числа вида "13 299.00" или "13299.00"
                     numbers = re.findall(r'[\d\s]+\.?\d*', price_text)
-                    # Фильтруем маленькие числа (меньше 100, вероятно это не цена)
+                    # Фильтруем маленькие числа (меньше 10, вероятно это не цена товара)
+                    # и числа, которые выглядят как количество (целые числа < 100)
                     valid_prices = []
                     for num_str in numbers:
                         num_clean = num_str.replace(' ', '')
                         try:
                             num_val = float(num_clean)
-                            if num_val >= 100:  # Минимальная цена товара обычно >= 100
+                            # Игнорируем маленькие числа (вероятно это количество или скидка)
+                            # и числа без десятичной части, которые меньше 100 (вероятно количество)
+                            if num_val >= 10 and ('.' in num_clean or num_val >= 100):
                                 valid_prices.append((num_val, num_str))
                         except:
                             continue
@@ -7884,6 +8875,7 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
                         logging.warning(f"Could not parse price from text: '{price_text}'")
                         continue
             
+            logging.info(f"💾 Сохраняем товар в items: name='{name}', quantity={quantity}, price={total_price}")
             items.append({
                 "name": name,
                 "quantity": quantity,
@@ -7900,6 +8892,10 @@ def parse_ofd_kz_html(html_content: str) -> Optional[Dict[str, Any]]:
         total_text = re.sub(r'\s+', '', total_text)
         total_match = re.search(r'(\d+\.?\d*)', total_text)
         total = float(total_match.group(1)) if total_match else 0.0
+        
+        logging.info(f"📦 Всего распарсено товаров: {len(items)}")
+        for idx, item in enumerate(items):
+            logging.info(f"  Товар {idx+1}: name='{item['name']}', quantity={item['quantity']}, price={item['price']}")
         
         # Если не нашли total, суммируем товары
         if total == 0.0 and items:
@@ -8263,6 +9259,22 @@ def build_receipt_payload(user_id: int, parsed: ParsedReceipt) -> Dict[str, Any]
     # Нормализуем название магазина
     normalized_store = normalize_store_name(parsed.store)
     
+    # ВАЖНО: сохраняем все позиции, включая дубликаты
+    # Не удаляем дубликаты, так как они могут быть реальными повторяющимися позициями в чеке
+    items_list = [asdict(item) for item in parsed.items]
+    
+    # Логируем информацию о позициях перед сохранением
+    logging.info(f"💾 Сохранение чека: items_count={len(items_list)}, total={parsed.total}")
+    if len(items_list) > 0:
+        # Проверяем наличие дубликатов по названию
+        item_names = [item.get("name", "") for item in items_list]
+        name_counts = {}
+        for name in item_names:
+            name_counts[name] = name_counts.get(name, 0) + 1
+        duplicates = {name: count for name, count in name_counts.items() if count > 1}
+        if duplicates:
+            logging.info(f"📋 Дубликаты позиций в чеке (это нормально): {duplicates}")
+    
     return {
         "user_id": user_id,
         "store": normalized_store,
@@ -8270,7 +9282,7 @@ def build_receipt_payload(user_id: int, parsed: ParsedReceipt) -> Dict[str, Any]
         "currency": parsed.currency,
         "purchased_at": parsed.purchased_at.isoformat(),
         "tax_amount": parsed.tax_amount,
-        "items": [asdict(item) for item in parsed.items],
+        "items": items_list,  # Сохраняем все позиции, включая дубликаты
         "receipt_hash": receipt_hash,
         "external_id": parsed.external_id,
         "merchant_address": parsed.merchant_address,
