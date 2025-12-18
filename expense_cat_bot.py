@@ -5557,21 +5557,45 @@ def generate_receipt_image(parsed: ParsedReceipt) -> Optional[bytes]:
         header_font_size = 28
         title_font_size = 32
         
-        # Пытаемся загрузить шрифт, если не получается - используем стандартный
-        try:
-            title_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", title_font_size)
-            header_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", header_font_size)
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-        except:
+        # Пытаемся загрузить шрифт с поддержкой казахских символов
+        # Приоритет: DejaVu Sans (лучшая поддержка Unicode) > Liberation Sans > системные шрифты > стандартный
+        font_paths = [
+            # Linux шрифты (для Railway/Docker)
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            # macOS шрифты
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/Arial.ttf",
+            # Windows шрифты (если используется)
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/calibri.ttf",
+        ]
+        
+        title_font = None
+        header_font = None
+        font = None
+        
+        # Пытаемся найти шрифт с поддержкой Unicode
+        for font_path in font_paths:
             try:
-                title_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", title_font_size)
-                header_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", header_font_size)
-                font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", font_size)
-            except:
-                # Используем стандартный шрифт
-                title_font = ImageFont.load_default()
-                header_font = ImageFont.load_default()
-                font = ImageFont.load_default()
+                if os.path.exists(font_path):
+                    title_font = ImageFont.truetype(font_path, title_font_size)
+                    header_font = ImageFont.truetype(font_path, header_font_size)
+                    font = ImageFont.truetype(font_path, font_size)
+                    logging.info(f"Using font: {font_path}")
+                    break
+            except Exception as e:
+                logging.debug(f"Failed to load font {font_path}: {e}")
+                continue
+        
+        # Если не нашли подходящий шрифт, используем стандартный
+        if title_font is None:
+            logging.warning("No suitable font found, using default font (may not support Kazakh characters)")
+            title_font = ImageFont.load_default()
+            header_font = ImageFont.load_default()
+            font = ImageFont.load_default()
         
         # Подготавливаем данные для таблицы (без эмодзи для изображения)
         store_text = parsed.store if parsed.store else ""
