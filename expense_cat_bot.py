@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ExpenseCatBot - Telegram бот для учета расходов по чекам и выпискам.
+Поддерживает распознавание чеков через OpenAI и локальный OCR (Tesseract/PaddleOCR).
+"""
+
 import asyncio
 import base64
 import csv
@@ -8,7 +15,14 @@ import logging
 import mimetypes
 import os
 import re
+import sys
 import time
+
+# Устанавливаем кодировку UTF-8 для вывода
+if sys.stdout.encoding != 'utf-8':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta

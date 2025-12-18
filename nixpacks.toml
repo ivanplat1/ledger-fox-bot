@@ -1,12 +1,25 @@
 [phases.setup]
-nixPkgs = ["python311", "tesseract", "zbar"]
+nixPkgs = ["python311", "tesseract", "tesseract-ocr-rus", "tesseract-ocr-kaz", "zbar", "glibcLocales"]
 
 [phases.install]
-cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install -r requirements.txt"
+]
 
 [phases.build]
-cmds = ["echo 'Build complete'"]
+cmds = [
+    "echo 'Build complete'",
+    "export LANG=en_US.UTF-8",
+    "export LC_ALL=en_US.UTF-8"
+]
 
 [start]
 cmd = "python expense_cat_bot.py"
+
+[variables]
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+PYTHONIOENCODING = "utf-8"
+PYTHONUNBUFFERED = "1"
 
