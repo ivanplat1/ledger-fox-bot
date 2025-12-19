@@ -146,6 +146,8 @@ class DeleteStates(StatesGroup):
 class ReportStates(StatesGroup):
     waiting_for_start_date = State()
     waiting_for_end_date = State()
+    waiting_for_single_date = State()
+    waiting_for_currency = State()
 
 
 class ExportStates(StatesGroup):
@@ -164,6 +166,12 @@ class DeleteExpenseStates(StatesGroup):
 
 class SetupStates(StatesGroup):
     waiting_for_currency = State()
+
+
+class ExpenseStates(StatesGroup):
+    waiting_for_expense_text = State()
+    waiting_for_category = State()
+    waiting_for_confirmation = State()
 
 
 @dataclass
@@ -198,10 +206,12 @@ class ParsedBankTransaction:
 
 @dataclass
 class ParsedManualExpense:
-    store: str
+    description: str  # Описание расхода (например, "кофе", "автосервис", "такси")
     amount: float
     currency: str
     occurred_at: datetime
+    category: Optional[str] = None  # Категория расхода
+    store: Optional[str] = None  # Магазин (опционально, если указан)
     note: Optional[str] = None
 
 
@@ -540,13 +550,13 @@ class ReceiptParserAI:
                 payload = self._build_payload(data_url)
             else:
                 logging.info(f"✅ Используем данные из QR-кода для структурирования (найдено {len(items_in_qr)} позиций), изображение НЕ отправляется")
-                payload = self._build_payload("", qr_data=qr_data)
+            payload = self._build_payload("", qr_data=qr_data)
         else:
             # Если QR-кода нет, используем изображение
             if not mime_type.startswith("image/"):
                 raise ReceiptParsingError("На данный момент поддерживаются только изображения чеков.")
-            data_url = build_data_url(file_bytes, mime_type)
-            payload = self._build_payload(data_url)
+        data_url = build_data_url(file_bytes, mime_type)
+        payload = self._build_payload(data_url)
         
         # Логируем запрос в OpenAI
         # Создаем копию payload для логирования с обрезанным data_url для читаемости
@@ -1115,46 +1125,95 @@ class SupabaseGateway:
         Категории берутся из items чеков, а не из категории расхода.
         """
         start_time = time.perf_counter()
+        logging.info(f"📊 [REPORT_FETCH] Starting report fetch: user_id={user_id}, period={period}, start_date={start_date}, end_date={end_date}")
+        
+        # Оптимизация: выбираем только нужные поля вместо * для ускорения запроса
+        # Это особенно важно, если в таблице есть большие JSONB поля или много колонок
         query = (
             self._client.table(self.expenses_table)
-            .select("*, receipt_id")
+            .select("id, user_id, amount, currency, date, receipt_id, category, store, source")
             .eq("user_id", user_id)
         )
+        logging.info(f"📊 [REPORT_FETCH] Base query created for user_id={user_id}")
         
         if period:
-            # Фильтр по периоду (месяц)
+            # Фильтр по периоду (месяц) - используем поле period, которое не изменилось
+            logging.info(f"📊 [REPORT_FETCH] Using period filter: {period}")
             query = query.ilike("period", period)
         elif start_date and end_date:
-            # Фильтр по диапазону дат
-            query = query.gte("date", start_date).lte("date", end_date)
+            # Фильтр по диапазону дат (date теперь TIMESTAMPTZ)
+            # Для корректного сравнения с TIMESTAMPTZ нужно добавить время
+            # Начало дня: 00:00:00, конец дня: 23:59:59.999 (включая весь день)
+            start_datetime = f"{start_date}T00:00:00Z"
+            # Для конца дня используем начало следующего дня (не включая его) для надежности
+            # Это гарантирует, что все траты за end_date будут включены
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+            end_datetime = (end_date_obj + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+            logging.info(f"📊 [REPORT_FETCH] Using date range filter: {start_datetime} to {end_datetime} (exclusive)")
+            query = query.gte("date", start_datetime).lt("date", end_datetime)
         else:
             # Если ничего не указано, берем текущий месяц
             period = datetime.utcnow().strftime("%Y-%m")
+            logging.info(f"📊 [REPORT_FETCH] No filter specified, using current month: {period}")
             query = query.ilike("period", period)
         
-        data = query.execute().data or []
+        logging.info(f"📊 [REPORT_FETCH] Executing query...")
+        query_start = time.perf_counter()
+        try:
+            result = query.execute()
+            data = result.data or []
+            query_time = time.perf_counter() - query_start
+            logging.info(f"📊 [REPORT_FETCH] Query executed in {query_time*1000:.1f}ms, got {len(data)} records")
+        except Exception as exc:
+            logging.exception(f"📊 [REPORT_FETCH] ❌ Error executing query: {exc}")
+            logging.error(f"📊 [REPORT_FETCH] Error type: {type(exc).__name__}")
+            logging.error(f"📊 [REPORT_FETCH] Error args: {exc.args}")
+            data = []
         
         # Группируем данные по валютам
         data_by_currency: Dict[str, List[Dict[str, Any]]] = {}
+        currency_samples = {}  # Для логирования примеров валют
+        
         for entry in data:
-            currency = entry.get("currency", "RUB") or "RUB"
+            currency = entry.get("currency")
+            # Логируем первые несколько примеров валют для диагностики
+            if len(currency_samples) < 5:
+                currency_samples[entry.get("id", "unknown")] = {
+                    "currency_raw": currency,
+                    "currency_type": type(currency).__name__ if currency else "None"
+                }
+            
+            # Если валюта не указана или пустая, используем RUB по умолчанию
+            if not currency or (isinstance(currency, str) and currency.strip() == ""):
+                currency = "RUB"
+            else:
+                currency = str(currency).upper().strip()  # Нормализуем валюту
+            
             if currency not in data_by_currency:
                 data_by_currency[currency] = []
             data_by_currency[currency].append(entry)
         
-        # Получаем все receipt_id из expenses
-        receipt_ids = [entry.get("receipt_id") for entry in data if entry.get("receipt_id")]
+        logging.info(f"📊 [REPORT_FETCH] Currency samples: {currency_samples}")
+        logging.info(f"📊 [REPORT_FETCH] Grouped data by currency: {list(data_by_currency.keys())}, counts: {[(k, len(v)) for k, v in data_by_currency.items()]}")
+        
+        # Получаем все receipt_id из expenses (уникальные)
+        receipt_ids = list(set(entry.get("receipt_id") for entry in data if entry.get("receipt_id")))
         
         # Получаем чеки для извлечения категорий из items и поиска самой дорогой покупки
         receipts_data = {}
         receipts_full_data = {}
         if receipt_ids:
+            receipts_query_start = time.perf_counter()
+            # Оптимизация: выбираем только нужные поля
             receipts_query = (
                 self._client.table(self.receipts_table)
                 .select("id, items, store, purchased_at, currency")
                 .in_("id", receipt_ids)
             )
             receipts_result = receipts_query.execute().data or []
+            receipts_query_time = time.perf_counter() - receipts_query_start
+            logging.info(f"📊 [REPORT_FETCH] Receipts query executed in {receipts_query_time*1000:.1f}ms, got {len(receipts_result)} receipts")
+            
             receipts_data = {r.get("id"): r.get("items", []) for r in receipts_result}
             receipts_full_data = {
                 r.get("id"): {
@@ -1170,56 +1229,56 @@ class SupabaseGateway:
         currencies_data = {}
         for currency, currency_data in data_by_currency.items():
             total = sum(entry.get("amount", 0.0) for entry in currency_data)
-        
-        # Разбивка по категориям товаров из items чеков
-        categories = {}
-        expenses_without_receipt = []
-        
-        for entry in currency_data:
-            receipt_id = entry.get("receipt_id")
-            if receipt_id and receipt_id in receipts_data:
-                # Берем категории из items чека
-                items = receipts_data[receipt_id]
-                if items and isinstance(items, list) and len(items) > 0:
-                    # Есть items - суммируем по категориям товаров
-                    for item in items:
-                        if isinstance(item, dict):
-                            item_category = item.get("category")
-                            item_price = float(item.get("price", 0.0))
-                            if item_category:
-                                categories[item_category] = categories.get(item_category, 0.0) + item_price
-                            else:
-                                # Если категории нет, используем "Другое"
-                                categories["Другое"] = categories.get("Другое", 0.0) + item_price
+            
+            # Разбивка по категориям товаров из items чеков
+            categories = {}
+            expenses_without_receipt = []
+            
+            for entry in currency_data:
+                receipt_id = entry.get("receipt_id")
+                if receipt_id and receipt_id in receipts_data:
+                    # Берем категории из items чека
+                    items = receipts_data[receipt_id]
+                    if items and isinstance(items, list) and len(items) > 0:
+                        # Есть items - суммируем по категориям товаров
+                        for item in items:
+                            if isinstance(item, dict):
+                                item_category = item.get("category")
+                                item_price = float(item.get("price", 0.0))
+                                if item_category:
+                                    categories[item_category] = categories.get(item_category, 0.0) + item_price
+                                else:
+                                    # Если категории нет, используем "Другое"
+                                    categories["Другое"] = categories.get("Другое", 0.0) + item_price
+                    else:
+                        # Нет items в чеке - используем категорию из expense или "Другое"
+                        expenses_without_receipt.append(entry)
                 else:
-                    # Нет items в чеке - используем категорию из expense или "Другое"
+                    # Нет чека - используем категорию из expense или "Другое"
                     expenses_without_receipt.append(entry)
-            else:
-                # Нет чека - используем категорию из expense или "Другое"
-                expenses_without_receipt.append(entry)
-        
-        # Обрабатываем расходы без чеков или без items
-        for entry in expenses_without_receipt:
-            category = entry.get("category") or "Другое"
-            amount = entry.get("amount", 0.0)
-            categories[category] = categories.get(category, 0.0) + amount
-        
-        # Разбивка по магазинам
-        stores = {}
-        for entry in currency_data:
-            store = entry.get("store") or "Без названия"
-            amount = entry.get("amount", 0.0)
-            stores[store] = stores.get(store, 0.0) + amount
-        
-        # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
-        daily = {}
-        for entry in currency_data:
-            date_str = entry.get("date", "")
-            if date_str:
-                day = date_str[:10]  # YYYY-MM-DD
+            
+            # Обрабатываем расходы без чеков или без items
+            for entry in expenses_without_receipt:
+                category = entry.get("category") or "Другое"
                 amount = entry.get("amount", 0.0)
-                daily[day] = daily.get(day, 0.0) + amount
-        
+                categories[category] = categories.get(category, 0.0) + amount
+            
+            # Разбивка по магазинам
+            stores = {}
+            for entry in currency_data:
+                store = entry.get("store") or "Без названия"
+                amount = entry.get("amount", 0.0)
+                stores[store] = stores.get(store, 0.0) + amount
+            
+            # Разбивка по дням (убрана из отчета, но оставляем для совместимости)
+            daily = {}
+            for entry in currency_data:
+                date_str = entry.get("date", "")
+                if date_str:
+                    day = date_str[:10]  # YYYY-MM-DD
+                    amount = entry.get("amount", 0.0)
+                    daily[day] = daily.get(day, 0.0) + amount
+            
             currencies_data[currency] = {
                 "total": total,
                 "by_category": categories,
@@ -1227,14 +1286,15 @@ class SupabaseGateway:
                 "by_day": daily,
                 "entries": currency_data,
             }
+            logging.info(f"📊 [REPORT_FETCH] Processed currency {currency}: total={total}, entries={len(currency_data)}")
         
-        # Поиск самой дорогой покупки (из items чеков) - по всем валютам
-        most_expensive_item = None
-        most_expensive_item_price = 0.0
-        most_expensive_item_store = ""
-        most_expensive_item_date = ""
-        most_expensive_item_currency = ""
+        logging.info(f"📊 [REPORT_FETCH] Final currencies_data keys: {list(currencies_data.keys())}, count: {len(currencies_data)}")
         
+        # Поиск самой дорогой покупки и самого дорогого расхода для каждой валюты отдельно
+        # Структура: {currency: {"item": {...}, "expense": {...}}}
+        most_expensive_by_currency = {}
+        
+        # Сначала ищем в items чеков
         for receipt_id, receipt_info in receipts_full_data.items():
             items = receipt_info.get("items", [])
             currency = receipt_info.get("currency", "RUB")
@@ -1242,28 +1302,52 @@ class SupabaseGateway:
                 for item in items:
                     if isinstance(item, dict):
                         item_price = float(item.get("price", 0.0))
-                        if item_price > most_expensive_item_price:
-                            most_expensive_item_price = item_price
-                            most_expensive_item = item.get("name", "Неизвестно")
-                            most_expensive_item_store = receipt_info.get("store", "Неизвестно")
-                            most_expensive_item_date = receipt_info.get("purchased_at", "")
-                            most_expensive_item_currency = currency
+                        # Инициализируем структуру для валюты, если её еще нет
+                        if currency not in most_expensive_by_currency:
+                            most_expensive_by_currency[currency] = {
+                                "item": {"price": 0.0, "name": None, "store": None, "date": None},
+                                "expense": {"amount": 0.0, "store": None, "date": None}
+                            }
+                        # Обновляем самую дорогую покупку для этой валюты
+                        if item_price > most_expensive_by_currency[currency]["item"]["price"]:
+                            most_expensive_by_currency[currency]["item"] = {
+                                "price": item_price,
+                                "name": item.get("name", "Неизвестно"),
+                                "store": receipt_info.get("store", "Неизвестно"),
+                                "date": receipt_info.get("purchased_at", "")
+                            }
         
-        # Поиск самого дорогого расхода (из expenses) - по всем валютам
-        most_expensive_expense = None
-        most_expensive_expense_amount = 0.0
-        most_expensive_expense_store = ""
-        most_expensive_expense_date = ""
-        most_expensive_expense_currency = ""
-        
+        # Теперь ищем в ручных расходах (expenses)
+        # Учитываем ручные расходы как "покупки" для определения самой дорогой покупки
         for entry in data:
             amount = float(entry.get("amount", 0.0))
             currency = entry.get("currency", "RUB")
-            if amount > most_expensive_expense_amount:
-                most_expensive_expense_amount = amount
-                most_expensive_expense_store = entry.get("store", "Неизвестно")
-                most_expensive_expense_date = entry.get("date", "")
-                most_expensive_expense_currency = currency
+            store = entry.get("store", "Неизвестно")
+            expense_date = entry.get("date", "")
+            
+            # Инициализируем структуру для валюты, если её еще нет
+            if currency not in most_expensive_by_currency:
+                most_expensive_by_currency[currency] = {
+                    "item": {"price": 0.0, "name": None, "store": None, "date": None},
+                    "expense": {"amount": 0.0, "store": None, "date": None}
+                }
+            
+            # Обновляем самую дорогую покупку для этой валюты (если ручной расход больше)
+            if amount > most_expensive_by_currency[currency]["item"]["price"]:
+                most_expensive_by_currency[currency]["item"] = {
+                    "price": amount,
+                    "name": store,  # Для ручных расходов используем store как название покупки
+                    "store": store,
+                    "date": expense_date
+                }
+            
+            # Обновляем самый дорогой расход для этой валюты
+            if amount > most_expensive_by_currency[currency]["expense"]["amount"]:
+                most_expensive_by_currency[currency]["expense"] = {
+                    "amount": amount,
+                    "store": store,
+                    "date": expense_date
+                }
         
         # Определяем период для отображения
         display_period = period
@@ -1278,19 +1362,7 @@ class SupabaseGateway:
         return {
             "period": display_period,
             "currencies_data": currencies_data,
-            "most_expensive_item": {
-                "name": most_expensive_item,
-                "price": most_expensive_item_price,
-                "store": most_expensive_item_store,
-                "date": most_expensive_item_date,
-                "currency": most_expensive_item_currency
-            } if most_expensive_item else None,
-            "most_expensive_expense": {
-                "amount": most_expensive_expense_amount,
-                "store": most_expensive_expense_store,
-                "date": most_expensive_expense_date,
-                "currency": most_expensive_expense_currency
-            } if most_expensive_expense_amount > 0 else None,
+            "most_expensive_by_currency": most_expensive_by_currency,  # Топы по каждой валюте отдельно
         }
 
     def _export_expenses_csv_sync(
@@ -1305,6 +1377,8 @@ class SupabaseGateway:
         if period:
             query = query.ilike("period", f"{period}%")
         elif start_date and end_date:
+            # Фильтр по диапазону дат (date теперь TIMESTAMPTZ)
+            # Supabase автоматически приведет строку даты к TIMESTAMPTZ
             query = query.gte("date", start_date).lte("date", end_date)
         elif start_date:
             query = query.gte("date", start_date)
@@ -1312,10 +1386,10 @@ class SupabaseGateway:
             query = query.lte("date", end_date)
         data = query.execute().data or []
         if not data:
-            return "id,store,currency,date,source,category,note,bank_transaction_id,receipt_id,status,amount\n"
+            return "id,store,currency,date,source,category,note,bank_transaction_id,receipt_id,amount\n"
         
         # Поля, которые нужно исключить
-        excluded_fields = {"created_at", "expense_hash", "period", "updated_at", "user_id"}
+        excluded_fields = {"created_at", "expense_hash", "period", "updated_at", "user_id", "status"}
         
         # Получаем все поля из данных, исключая ненужные
         all_fields = {field for row in data for field in row.keys() if field not in excluded_fields}
@@ -1334,17 +1408,28 @@ class SupabaseGateway:
             formatted_row = {}
             for key in fieldnames:
                 value = row.get(key)
-                # Если это поле date, убираем время (оставляем только дату)
+                # Если это поле date, форматируем с временем
                 if key == "date" and value:
                     if isinstance(value, str):
-                        # Если дата в формате ISO с временем, берем только дату
+                        # Если дата в формате ISO с временем, оставляем как есть
+                        # Если только дата, добавляем время 00:00:00
                         if "T" in value:
-                            value = value.split("T")[0]
+                            # Уже есть время, оставляем как есть
+                            pass
                         elif " " in value:
-                            value = value.split(" ")[0]
+                            # Есть пробел, значит формат "YYYY-MM-DD HH:MM:SS"
+                            pass
+                        elif len(value) == 10:
+                            # Только дата, добавляем время
+                            value = value + "T00:00:00Z"
                     elif hasattr(value, 'strftime'):
-                        # Если это объект datetime/date, форматируем как дату
-                        value = value.strftime("%Y-%m-%d")
+                        # Если это объект datetime/date, форматируем с временем
+                        if hasattr(value, 'hour'):
+                            # Это datetime, есть время
+                            value = value.strftime("%Y-%m-%dT%H:%M:%S")
+                        else:
+                            # Это date, нет времени
+                            value = value.strftime("%Y-%m-%dT00:00:00")
                 formatted_row[key] = value
             writer.writerow(formatted_row)
         
@@ -2332,7 +2417,8 @@ class ExpenseCatBot:
         token: str, 
         supabase_gateway: Optional[SupabaseGateway] = None,
         feedback_chat_id: Optional[str] = None,
-        failed_receipts_chat_id: Optional[str] = None
+        failed_receipts_chat_id: Optional[str] = None,
+        admin_user_ids: Optional[set[int]] = None
     ) -> None:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
@@ -2340,6 +2426,7 @@ class ExpenseCatBot:
         self.supabase = supabase_gateway
         self.feedback_chat_id = feedback_chat_id  # ID канала/чата для отзывов
         self.failed_receipts_chat_id = failed_receipts_chat_id  # ID канала для фейлов чеков
+        self.admin_user_ids = admin_user_ids or set()  # Список ID администраторов
         self._media_group_cache: Dict[str, List[Message]] = {}
         self._media_group_tasks: Dict[str, asyncio.Task] = {}
         
@@ -2368,6 +2455,11 @@ class ExpenseCatBot:
         photo_bytes: Optional[bytes] = None
     ) -> None:
         """Отправляет отзыв в канал обратной связи"""
+        # Проверяем, что канал настроен
+        if not self.feedback_chat_id:
+            logging.warning("Feedback channel not configured (FEEDBACK_CHAT_ID not set)")
+            return
+        
         # Формируем сообщение
         user_info = f"ID: {user_id}"
         if username:
@@ -2618,6 +2710,35 @@ class ExpenseCatBot:
                 f"   3. Для публичных каналов можно использовать @channel_name"
             )
 
+    def _create_category_keyboard(self) -> InlineKeyboardMarkup:
+        """Создает клавиатуру с категориями расходов"""
+        categories = [
+            ["Продукты", "Мясо/Рыба", "Молочные продукты"],
+            ["Хлеб/Выпечка", "Овощи/Фрукты", "Напитки"],
+            ["Алкоголь", "Сладости", "Ресторан/Кафе"],
+            ["Доставка еды", "Фастфуд", "Транспорт"],
+            ["Такси", "Парковка", "Бензин/Топливо"],
+            ["Здоровье", "Медицина", "Аптека"],
+            ["Одежда", "Обувь", "Бытовая химия"],
+            ["Косметика/Гигиена", "Электроника", "Техника"],
+            ["Образование", "Книги", "Развлечения"],
+            ["Спорт", "Фитнес", "Путешествия"],
+            ["Коммунальные", "Интернет/Связь", "Ремонт"],
+            ["Другое"]
+        ]
+        
+        keyboard_buttons = []
+        for row in categories:
+            button_row = []
+            for category in row:
+                button_row.append(InlineKeyboardButton(
+                    text=category,
+                    callback_data=f"expense_category_{category}"
+                ))
+            keyboard_buttons.append(button_row)
+        
+        return InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
     def _create_currency_keyboard(self) -> InlineKeyboardMarkup:
         """Создает клавиатуру для выбора валюты"""
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -2642,6 +2763,18 @@ class ExpenseCatBot:
         supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         feedback_chat_id = os.getenv("FEEDBACK_CHAT_ID")  # ID канала/чата для отзывов
         failed_receipts_chat_id = os.getenv("FAILED_RECEIPTS_CHAT_ID")  # ID канала для фейлов чеков
+        
+        # Список администраторов (ID пользователей через запятую)
+        admin_user_ids_str = os.getenv("ADMIN_USER_IDS", "").strip()
+        admin_user_ids = set()
+        if admin_user_ids_str:
+            try:
+                admin_user_ids = {int(uid.strip()) for uid in admin_user_ids_str.split(",") if uid.strip()}
+                logging.info(f"Admin user IDs configured: {admin_user_ids}")
+            except ValueError:
+                logging.warning(f"Invalid ADMIN_USER_IDS format: {admin_user_ids_str}")
+        else:
+            logging.info("No ADMIN_USER_IDS configured, stats command will be disabled")
         if not token:
             raise RuntimeError("EXPENSECAT_BOT_TOKEN is required to run ExpenseCatBot.")
         gateway = None
@@ -2659,7 +2792,8 @@ class ExpenseCatBot:
             token=token, 
             supabase_gateway=gateway, 
             feedback_chat_id=feedback_chat_id,
-            failed_receipts_chat_id=failed_receipts_chat_id
+            failed_receipts_chat_id=failed_receipts_chat_id,
+            admin_user_ids=admin_user_ids
         )
 
     async def run(self) -> None:
@@ -2672,10 +2806,10 @@ class ExpenseCatBot:
             BotCommand(command="statement", description="Импортировать выписку"),
             BotCommand(command="export", description="Экспорт данных в CSV"),
             BotCommand(command="limits", description="Проверить лимиты и подписку"),
-            BotCommand(command="subscribe", description="Оформить подписку Premium"),
+            BotCommand(command="subscribe", description="Оформить подписку"),
             BotCommand(command="feedback", description="Обратная связь (ошибки, предложения)"),
             BotCommand(command="settings", description="Настройки (валюта по умолчанию)"),
-            BotCommand(command="stats", description="Статистика распознавания чеков"),
+            # Команда /stats скрыта от обычных пользователей (только для администраторов)
             BotCommand(command="delete_expense", description="Удалить расход"),
             BotCommand(command="delete_all", description="Удалить все данные"),
         ]
@@ -2718,6 +2852,12 @@ class ExpenseCatBot:
                             "📊 Создаю отчёты по категориям и магазинам\n"
                             "💰 Поддерживаю несколько валют\n"
                             "📤 Экспортирую данные в CSV\n\n"
+                            "💡 Умное распознавание:\n"
+                            "Я автоматически определяю, что вы хотите сделать, по типу отправленного контента:\n"
+                            "• 📸 Отправьте фото → я распознаю чек\n"
+                            "• 📝 Отправьте текст с суммой (например, \"кофе 1300\" или \"автосервис 10к\") → я добавлю расход\n"
+                            "• 📄 Отправьте файл банковской выписки (CSV/PDF/XLSX) → я импортирую транзакции\n\n"
+                            "Команды не обязательны — просто отправьте нужный контент!\n\n"
                             "💰 Для начала выберите валюту по умолчанию:",
                             reply_markup=keyboard
                         )
@@ -2727,19 +2867,20 @@ class ExpenseCatBot:
             # Обычное приветствие для существующих пользователей
             await message.answer(
                 "👋 Привет! Я помогу вам вести учёт расходов.\n\n"
+                "💡 Умное распознавание:\n"
+                "Я автоматически определяю, что вы хотите сделать, по типу отправленного контента:\n"
+                "• 📸 Отправьте фото → я распознаю чек\n"
+                "• 📝 Отправьте текст с суммой (например, \"кофе 1300\" или \"автосервис 10к\") → я добавлю расход\n"
+                "• 📄 Отправьте файл банковской выписки (CSV/PDF/XLSX) → я импортирую транзакции\n\n"
+                "Команды не обязательны — просто отправьте нужный контент!\n\n"
                 "✨ Основные возможности:\n"
-                "📸 Отправляйте фото чеков — распознаю автоматически\n"
-                "📝 Добавляйте расходы вручную текстом\n"
-                "🏦 Импортируйте банковские выписки\n"
                 "📊 Получайте отчёты по категориям, магазинам и периодам\n"
                 "💰 Поддерживаю несколько валют\n"
                 "📤 Экспортируйте данные в CSV\n\n"
                 "📋 Команды:\n"
-                "/expense — добавить расход вручную\n"
                 "/report — получить отчёт\n"
-                "/statement — импортировать выписку\n"
                 "/export — экспорт в CSV\n"
-                "/subscribe — оформить подписку Premium\n"
+                "/subscribe — оформить подписку\n"
                 "/delete_expense — удалить расход\n"
                 "/settings — настройки"
             )
@@ -2822,10 +2963,18 @@ class ExpenseCatBot:
         
         @self.router.message(Command("stats"))
         async def handle_stats(message: Message) -> None:
-            """Обработчик команды /stats - показывает статистику распознавания чеков"""
+            """Обработчик команды /stats - показывает статистику распознавания чеков (только для администраторов)"""
             if not message.from_user:
                 await message.answer("Не удалось определить пользователя.")
                 return
+            
+            # Проверка доступа: только администраторы могут видеть статистику
+            if message.from_user.id not in self.admin_user_ids:
+                logging.info(f"User {message.from_user.id} attempted to access /stats (not admin)")
+                await message.answer("❌ Эта команда недоступна.")
+                return
+            
+            logging.info(f"Admin user {message.from_user.id} accessed /stats")
             
             if not self.supabase:
                 await message.answer("База данных недоступна.")
@@ -3237,6 +3386,135 @@ class ExpenseCatBot:
             await self._process_statement_message(message)
             await state.clear()
 
+        @self.router.message(Command("report"))
+        async def handle_report(message: Message, state: FSMContext) -> None:
+            try:
+                logging.info(f"📊 [REPORT] Command /report received from user {message.from_user.id if message.from_user else 'unknown'}")
+                logging.info(f"📊 [REPORT] Message object: {message}")
+                logging.info(f"📊 [REPORT] State before clear: {await state.get_state()}")
+                
+                await state.clear()
+                logging.info(f"📊 [REPORT] State after clear: {await state.get_state()}")
+                
+                if not self.supabase:
+                    logging.warning("📊 [REPORT] Supabase not available for report command")
+                    await message.answer(
+                        "Отчёты по расходам появятся после подключения базы (Supabase)."
+                    )
+                    return
+                
+                if not message.from_user:
+                    logging.warning("📊 [REPORT] No user in /report command")
+                    await message.answer("❌ Ошибка: не удалось определить пользователя.")
+                    return
+                
+                logging.info(f"📊 [REPORT] Creating keyboard for user {message.from_user.id}")
+                # Показываем меню выбора периода
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="📅 Текущий месяц", callback_data="report_current_month"),
+                        InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="report_last_month"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="📅 Текущая неделя", callback_data="report_current_week"),
+                        InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="report_last_week"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="📅 Текущий год", callback_data="report_current_year"),
+                        InlineKeyboardButton(text="📅 Произвольный период", callback_data="report_custom"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="📅 За один день", callback_data="report_single_day"),
+                    ],
+                ])
+                logging.info(f"📊 [REPORT] Keyboard created, sending message to user {message.from_user.id}")
+                result = await message.answer(
+                    "📊 Выберите период для отчета:",
+                    reply_markup=keyboard
+                )
+                logging.info(f"📊 [REPORT] ✅ Report menu sent successfully to user {message.from_user.id}, message_id={result.message_id if result else 'None'}")
+            except Exception as exc:
+                logging.exception(f"📊 [REPORT] ❌ Error in handle_report: {exc}")
+                logging.error(f"📊 [REPORT] Error type: {type(exc).__name__}")
+                logging.error(f"📊 [REPORT] Error args: {exc.args}")
+                try:
+                    await message.answer(f"❌ Ошибка при обработке команды /report: {str(exc)[:200]}")
+                except Exception as send_exc:
+                    logging.error(f"📊 [REPORT] Failed to send error message to user: {send_exc}")
+
+        @self.router.message(Command("export"))
+        async def handle_export(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            if not self.supabase:
+                await message.answer("Экспорт доступен после подключения Supabase.")
+                return
+            
+            # Проверяем, есть ли у пользователя настройки (валюта по умолчанию)
+            if message.from_user:
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                if not settings:
+                    # Если настроек нет, предлагаем выбрать валюту
+                    keyboard = self._create_currency_keyboard()
+                    await message.answer(
+                        "📤 Экспортирую данные в CSV\n\n"
+                        "💰 Для начала выберите валюту по умолчанию:",
+                        reply_markup=keyboard
+                    )
+                    await state.set_state(SetupStates.waiting_for_currency)
+                    return
+            
+            # Показываем меню выбора периода
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="📅 Текущий месяц", callback_data="export_current_month"),
+                    InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="export_last_month"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущая неделя", callback_data="export_current_week"),
+                    InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="export_last_week"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Текущий год", callback_data="export_current_year"),
+                    InlineKeyboardButton(text="📅 Произвольный период", callback_data="export_custom"),
+                ],
+                [
+                    InlineKeyboardButton(text="📅 Все данные", callback_data="export_all"),
+                ],
+            ])
+            await message.answer(
+                "📤 Выберите период для экспорта:",
+                reply_markup=keyboard
+            )
+
+        @self.router.message(Command("expense"))
+        async def handle_expense_entry(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            
+            # Получаем валюту по умолчанию пользователя
+            default_currency = "RUB"
+            if self.supabase and message.from_user:
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                if settings and settings.get("default_currency"):
+                    default_currency = settings.get("default_currency")
+            
+            instructions = (
+                "📝 Введите расход в формате:\n\n"
+                "Примеры:\n"
+                "• кофе 1300\n"
+                "• автосервис 10к\n"
+                "• такси 1200 KZT\n"
+                "• продукты 5000 15.12.2025\n\n"
+                "Вы можете указать:\n"
+                "• Описание расхода\n"
+                "• Сумму (можно использовать сокращения: к, тыс, т.р., тр и т.д.)\n"
+                "• Валюту (₽, руб, ₸, тг, $, usd, €, eur и др.)\n"
+                "• Дату (ДД.ММ.ГГГГ, опционально)"
+            )
+            
+            await message.answer(instructions)
+            await state.set_state(ExpenseStates.waiting_for_expense_text)
+            logging.info(f"📝 [EXPENSE] Set state to waiting_for_expense_text for user {message.from_user.id if message.from_user else 'unknown'}")
+
         @self.router.message(Command("qr"))
         async def handle_qr_command(message: Message, state: FSMContext) -> None:
             await state.clear()
@@ -3317,6 +3595,7 @@ class ExpenseCatBot:
             
             # Отправляем в канал обратной связи, если настроен
             if self.feedback_chat_id:
+                logging.info(f"📤 Sending feedback with photo to channel: {self.feedback_chat_id}")
                 try:
                     # Отправляем фото в канал, если есть
                     photo_bytes = None
@@ -3325,9 +3604,11 @@ class ExpenseCatBot:
                         photo = message.photo[-1]
                         file = await self.bot.get_file(photo.file_id)
                         photo_bytes = await self._download_file(file.file_path)
+                        logging.info(f"📷 Downloaded photo for feedback, size: {len(photo_bytes) if photo_bytes else 0} bytes")
                     elif message.document:
                         file = await self.bot.get_file(message.document.file_id)
                         photo_bytes = await self._download_file(file.file_path)
+                        logging.info(f"📄 Downloaded document for feedback, size: {len(photo_bytes) if photo_bytes else 0} bytes")
                     
                     await self._send_feedback_to_channel(
                         user_id=user_id,
@@ -3339,8 +3620,11 @@ class ExpenseCatBot:
                         feedback_text=feedback_text,
                         photo_bytes=photo_bytes
                     )
+                    logging.info(f"✅ Feedback with photo successfully sent to channel")
                 except Exception as exc:
-                    logging.exception(f"Ошибка при отправке отзыва с фото в канал: {exc}")
+                    logging.exception(f"❌ Ошибка при отправке отзыва с фото в канал: {exc}")
+            else:
+                logging.warning("⚠️ Feedback channel not configured (FEEDBACK_CHAT_ID not set), skipping channel send")
             
             await message.answer(
                 f"✅ Спасибо за вашу обратную связь!\n\n"
@@ -3352,10 +3636,27 @@ class ExpenseCatBot:
 
         @self.router.message(F.photo | F.document)
         async def handle_smart_upload(message: Message, state: FSMContext) -> None:
+            """Автоматическая обработка фото и документов: фото → чек, документ → выписка"""
+            # Проверяем, не находимся ли мы в специфическом состоянии (feedback и т.д.)
+            current_state = await state.get_state()
+            if current_state:
+                state_name = str(current_state)
+                # Если в состоянии feedback, не обрабатываем как чек/выписку
+                if "FeedbackStates" in state_name:
+                    return  # Пусть специфический обработчик обработает
             
             if message.media_group_id:
                 await self._collect_media_group(message)
                 return
+            
+            # Определяем тип: фото → чек, документ → выписка
+            if message.photo:
+                # Фото всегда считаем чеком
+                await state.clear()
+                await self._process_receipt_message(message, state)
+                return
+            
+            # Для документов определяем по расширению и MIME типу
             classification = classify_upload_kind(message)
             if classification == "receipt":
                 await state.clear()
@@ -3365,8 +3666,17 @@ class ExpenseCatBot:
                 await state.clear()
                 await self._process_statement_message(message)
                 return
+            
+            # Если не удалось определить, считаем документ выпиской
+            if message.document:
+                await state.clear()
+                await self._process_statement_message(message)
+                return
+            
             instructions = (
-                "Не понял, это чек или выписка. Используйте /receipt или /statement.\n\n"
+                "Не удалось определить тип файла. Используйте:\n"
+                "• /receipt — для чеков\n"
+                "• /statement — для выписок\n\n"
                 "💡 Если это чек:\n"
                 "• Чек должен занимать всё пространство на фото\n"
                 "• Если чек длинный, сделайте панораму\n"
@@ -3374,412 +3684,68 @@ class ExpenseCatBot:
             )
             await message.answer(instructions)
 
-        @self.router.message(Command("export"))
-        async def handle_export(message: Message, state: FSMContext) -> None:
-            await state.clear()
-            if not self.supabase:
-                await message.answer("Экспорт доступен после подключения Supabase.")
+        # Обработчик с состоянием должен быть ПЕРЕД общим F.text обработчиком
+        @self.router.message(ExpenseStates.waiting_for_expense_text)
+        async def handle_expense_text(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода текста расхода"""
+            if not message.text or not message.from_user:
+                await message.answer("❌ Пожалуйста, отправьте текст расхода.")
                 return
             
-            # Показываем меню выбора периода
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="📅 Текущий месяц", callback_data="export_current_month"),
-                    InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="export_last_month"),
-                ],
-                [
-                    InlineKeyboardButton(text="📅 Текущая неделя", callback_data="export_current_week"),
-                    InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="export_last_week"),
-                ],
-                [
-                    InlineKeyboardButton(text="📅 Текущий год", callback_data="export_current_year"),
-                    InlineKeyboardButton(text="📅 Произвольный период", callback_data="export_custom"),
-                ],
-                [
-                    InlineKeyboardButton(text="📅 Все данные", callback_data="export_all"),
-                ],
-            ])
-            await message.answer(
-                "📤 Выберите период для экспорта:",
-                reply_markup=keyboard
-            )
-
-        @self.router.message(Command("feedback"))
-        async def handle_feedback(message: Message, state: FSMContext) -> None:
-            """Обработчик команды для обратной связи"""
-            await state.set_state(FeedbackStates.waiting_for_feedback_type)
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🐛 Сообщить об ошибке", callback_data="feedback_bug"),
-                ],
-                [
-                    InlineKeyboardButton(text="💡 Предложить функцию", callback_data="feedback_suggestion"),
-                    InlineKeyboardButton(text="😞 Пожаловаться", callback_data="feedback_complaint"),
-                ],
-            ])
-            
-            await message.answer(
-                "📢 Выберите тип обратной связи:",
-                reply_markup=keyboard
-            )
-        
-        @self.router.callback_query(F.data.startswith("feedback_"))
-        async def handle_feedback_type(callback: CallbackQuery, state: FSMContext) -> None:
-            """Обработчик выбора типа обратной связи"""
-            await callback.answer()
-            
-            feedback_type = callback.data.replace("feedback_", "")
-            type_names = {
-                "bug": "ошибка",
-                "suggestion": "предложение",
-                "complaint": "жалоба"
-            }
-            type_emojis = {
-                "bug": "🐛",
-                "suggestion": "💡",
-                "complaint": "😞"
-            }
-            type_instructions = {
-                "bug": "Опишите ошибку подробно. Что вы делали, когда это произошло? Что должно было произойти и что произошло на самом деле?",
-                "suggestion": "Опишите вашу идею подробно. Какую функцию вы хотели бы видеть в боте?",
-                "complaint": "Опишите проблему, с которой вы столкнулись. Что вас не устраивает?"
-            }
-            
-            type_name = type_names.get(feedback_type, feedback_type)
-            emoji = type_emojis.get(feedback_type, "📝")
-            instruction = type_instructions.get(feedback_type, "Опишите проблему подробно.")
-            
-            await state.update_data(feedback_type=feedback_type)
-            await state.set_state(FeedbackStates.waiting_for_feedback_text)
-            
-            await callback.message.answer(
-                f"{emoji} Вы выбрали: {type_name}\n\n{instruction}"
-            )
-        
-        @self.router.message(FeedbackStates.waiting_for_feedback_text)
-        async def handle_feedback_text(message: Message, state: FSMContext) -> None:
-            """Обработчик ввода текста обратной связи"""
-            if not message.text or message.text.startswith("/"):
-                await message.answer(
-                    "❌ Пожалуйста, отправьте текстовое сообщение. "
-                    "Используйте /cancel для отмены."
-                )
-                return
-            
-            feedback_text = message.text.strip()
-            data = await state.get_data()
-            feedback_type = data.get("feedback_type", "unknown")
-            
-            user_id = message.from_user.id if message.from_user else None
-            username = message.from_user.username if message.from_user else "unknown"
-            first_name = message.from_user.first_name if message.from_user else "unknown"
-            
-            type_names = {
-                "bug": "ошибка",
-                "suggestion": "предложение",
-                "complaint": "жалоба"
-            }
-            type_emojis = {
-                "bug": "🐛",
-                "suggestion": "💡",
-                "complaint": "😞"
-            }
-            
-            type_name = type_names.get(feedback_type, feedback_type)
-            emoji = type_emojis.get(feedback_type, "📝")
-            
-            # Логируем обратную связь
-            logging.info(
-                f"Feedback [{feedback_type}] from user_id={user_id} "
-                f"(@{username}, {first_name}): {feedback_text}"
-            )
-            
-            # Сохраняем в базу данных, если Supabase подключен
+            # Получаем валюту по умолчанию пользователя
+            default_currency = "RUB"
             if self.supabase:
-                try:
-                    await self.supabase.save_feedback(
-                        user_id=user_id,
-                        username=username,
-                        first_name=first_name,
-                        feedback_type=feedback_type,
-                        feedback_text=feedback_text
-                    )
-                except Exception as exc:
-                    logging.exception(f"Ошибка при сохранении отзыва в базу данных: {exc}")
+                settings = await self.supabase.get_user_settings(message.from_user.id)
+                if settings and settings.get("default_currency"):
+                    default_currency = settings.get("default_currency")
             
-            # Отправляем в канал обратной связи, если настроен
-            if self.feedback_chat_id:
-                try:
-                    await self._send_feedback_to_channel(
-                        user_id=user_id,
-                        username=username,
-                        first_name=first_name,
-                        feedback_type=feedback_type,
-                        type_name=type_name,
-                        emoji=emoji,
-                        feedback_text=feedback_text
-                    )
-                except Exception as exc:
-                    logging.exception(f"Ошибка при отправке отзыва в канал: {exc}")
-            
-            await message.answer(
-                f"✅ Спасибо за вашу обратную связь!\n\n"
-                f"{emoji} Тип: {type_name}\n"
-                f"📝 Ваше сообщение:\n{feedback_text}\n\n"
-                "Мы обязательно рассмотрим ваше сообщение и учтём его при улучшении бота."
-            )
-            
-            await state.clear()
-
-        @self.router.message(Command("import"))
-        async def handle_import(message: Message, state: FSMContext) -> None:
-            await state.clear()
-            await message.answer(
-                "Для импорта пришли CSV/XLSX/PDF выписку или отчёт из другого сервиса. "
-                "Мы автоматически распознаем формат и подскажем, что делать дальше."
-            )
-
-        @self.router.message(Command("report"))
-        async def handle_report(message: Message, state: FSMContext) -> None:
-            await state.clear()
-            if not self.supabase:
+            # Парсим расход
+            parsed = parse_manual_expense(message.text, default_currency)
+            if not parsed:
                 await message.answer(
-                    "Отчёты по расходам появятся после подключения базы (Supabase)."
+                    "❌ Не удалось распознать расход. Пожалуйста, укажите сумму.\n\n"
+                    "Примеры:\n"
+                    "• кофе 1300\n"
+                    "• автосервис 10к\n"
+                    "• такси 1200 KZT"
                 )
                 return
             
-            # Показываем меню выбора периода
+            # Сохраняем распарсенные данные в состояние
+            await state.update_data(
+                parsed_expense=parsed,
+                expense_text=message.text
+            )
+            
+            # Показываем подтверждение распознавания (товар, цена, валюта)
+            currency_symbols = {
+                "RUB": "₽",
+                "KZT": "₸",
+                "USD": "$",
+                "EUR": "€",
+                "GBP": "£",
+                "GEL": "₾",
+            }
+            currency_symbol = currency_symbols.get(parsed.currency, parsed.currency)
+            
+            confirmation_text = (
+                f"📝 <b>Расход:</b> {parsed.description}\n"
+                f"💰 <b>Сумма:</b> {parsed.amount:.2f} {currency_symbol}\n"
+                f"📅 <b>Дата:</b> {parsed.occurred_at.strftime('%d.%m.%Y')}\n\n"
+                f"Всё верно?"
+            )
+            
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="📅 Текущий месяц", callback_data="report_current_month"),
-                    InlineKeyboardButton(text="📅 Прошлый месяц", callback_data="report_last_month"),
-                ],
-                [
-                    InlineKeyboardButton(text="📅 Текущая неделя", callback_data="report_current_week"),
-                    InlineKeyboardButton(text="📅 Прошлая неделя", callback_data="report_last_week"),
-                ],
-                [
-                    InlineKeyboardButton(text="📅 Текущий год", callback_data="report_current_year"),
-                    InlineKeyboardButton(text="📅 Произвольный период", callback_data="report_custom"),
-                ],
+                    InlineKeyboardButton(text="✅ Да, верно", callback_data="expense_confirm_parsed"),
+                    InlineKeyboardButton(text="❌ Нет, исправить", callback_data="expense_cancel")
+                ]
             ])
-            await message.answer(
-                "📊 Выберите период для отчета:",
-                reply_markup=keyboard
-            )
-        
-        @self.router.callback_query(F.data.startswith("report_"))
-        async def handle_report_period(callback: CallbackQuery, state: FSMContext) -> None:
-            await callback.answer()
             
-            if not self.supabase:
-                await callback.message.answer("Отчёты по расходам появятся после подключения базы (Supabase).")
-            return
-            
-            now = datetime.utcnow()
-            period = None
-            start_date = None
-            end_date = None
-            
-            if callback.data == "report_current_month":
-                period = now.strftime("%Y-%m")
-            elif callback.data == "report_last_month":
-                # Прошлый месяц
-                last_month = (now.replace(day=1) - timedelta(days=1))
-                period = last_month.strftime("%Y-%m")
-            elif callback.data == "report_current_week":
-                # Текущая неделя (понедельник - воскресенье)
-                days_since_monday = now.weekday()
-                start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
-                end_date = now.strftime("%Y-%m-%d")
-            elif callback.data == "report_last_week":
-                # Прошлая неделя
-                days_since_monday = now.weekday()
-                week_start = now - timedelta(days=days_since_monday + 7)
-                week_end = now - timedelta(days=days_since_monday + 1)
-                start_date = week_start.strftime("%Y-%m-%d")
-                end_date = week_end.strftime("%Y-%m-%d")
-            elif callback.data == "report_current_year":
-                # Текущий год
-                start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
-                end_date = now.strftime("%Y-%m-%d")
-            elif callback.data == "report_custom":
-                # Произвольный период - запрашиваем даты
-                await callback.message.answer(
-                    "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
-                )
-                await state.set_state(ReportStates.waiting_for_start_date)
-                return
-            
-            # Получаем отчет
-            report = await self.supabase.fetch_monthly_report(
-                callback.from_user.id, 
-                period=period,
-                start_date=start_date,
-                end_date=end_date
-            )
-            
-            # Форматируем отчет с разбивкой
-            report_text = format_report(report)
-            
-            # Обрезаем если слишком длинный
-            truncated_report = truncate_message_for_telegram(report_text)
-            await callback.message.answer(truncated_report)
-        
-        @self.router.callback_query(F.data.startswith("export_"))
-        async def handle_export_period(callback: CallbackQuery, state: FSMContext) -> None:
-            await callback.answer()
-            
-            if not self.supabase:
-                await callback.message.answer("Экспорт доступен после подключения Supabase.")
-                return
-            
-            now = datetime.utcnow()
-            period = None
-            start_date = None
-            end_date = None
-            
-            if callback.data == "export_current_month":
-                period = now.strftime("%Y-%m")
-            elif callback.data == "export_last_month":
-                # Прошлый месяц
-                last_month = (now.replace(day=1) - timedelta(days=1))
-                period = last_month.strftime("%Y-%m")
-            elif callback.data == "export_current_week":
-                # Текущая неделя (понедельник - воскресенье)
-                days_since_monday = now.weekday()
-                start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
-                end_date = now.strftime("%Y-%m-%d")
-            elif callback.data == "export_last_week":
-                # Прошлая неделя
-                days_since_monday = now.weekday()
-                week_start = now - timedelta(days=days_since_monday + 7)
-                week_end = now - timedelta(days=days_since_monday + 1)
-                start_date = week_start.strftime("%Y-%m-%d")
-                end_date = week_end.strftime("%Y-%m-%d")
-            elif callback.data == "export_current_year":
-                # Текущий год
-                start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
-                end_date = now.strftime("%Y-%m-%d")
-            elif callback.data == "export_custom":
-                # Произвольный период - запрашиваем даты
-                await callback.message.answer(
-                    "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
-                )
-                await state.set_state(ExportStates.waiting_for_start_date)
-                return
-            elif callback.data == "export_all":
-                period = None
-                start_date = None
-                end_date = None
-            
-            # Выполняем экспорт
-            await callback.message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
-            csv_blob = await self.supabase.export_expenses_csv(
-                callback.from_user.id, 
-                period=period,
-                start_date=start_date,
-                end_date=end_date
-            )
-            
-            # Формируем имя файла и описание периода
-            if period:
-                filename = f"expensecat_export_{period}.csv"
-                # Форматируем период для отображения
-                try:
-                    date_obj = datetime.strptime(period, "%Y-%m")
-                    months = ["январь", "февраль", "март", "апрель", "май", "июнь",
-                             "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
-                    month_name = months[date_obj.month - 1]
-                    period_text = f"{month_name} {date_obj.year}"
-                except:
-                    period_text = period
-            elif start_date and end_date:
-                filename = f"expensecat_export_{start_date}_{end_date}.csv"
-                # Форматируем даты для отображения
-                try:
-                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
-                except:
-                    period_text = f"{start_date} - {end_date}"
-            else:
-                filename = "expensecat_export_all.csv"
-                period_text = "все данные"
-            
-            file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
-            await callback.message.answer_document(
-                document=file,
-                caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
-            )
-            await state.clear()
-        
-        @self.router.message(ExportStates.waiting_for_start_date)
-        async def handle_export_start_date(message: Message, state: FSMContext) -> None:
-            """Обработчик ввода даты начала периода для экспорта"""
-            try:
-                # Парсим дату в формате ДД.ММ.ГГГГ
-                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
-                start_date = date_obj.strftime("%Y-%m-%d")
-                await state.update_data(start_date=start_date)
-                await message.answer(
-                    "📅 Введите дату окончания периода в формате ДД.ММ.ГГГГ (например, 31.12.2025):"
-                )
-                await state.set_state(ExportStates.waiting_for_end_date)
-            except ValueError:
-                await message.answer(
-                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 01.12.2025):"
-                )
-        
-        @self.router.message(ExportStates.waiting_for_end_date)
-        async def handle_export_end_date(message: Message, state: FSMContext) -> None:
-            """Обработчик ввода даты окончания периода для экспорта"""
-            try:
-                # Парсим дату в формате ДД.ММ.ГГГГ
-                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
-                end_date = date_obj.strftime("%Y-%m-%d")
-                data = await state.get_data()
-                start_date = data.get("start_date")
-                
-                if not start_date:
-                    await message.answer("❌ Ошибка: не найдена дата начала. Начните заново с /export")
-                    await state.clear()
-                    return
+            await message.answer(confirmation_text, reply_markup=keyboard, parse_mode="HTML")
+            await state.set_state(ExpenseStates.waiting_for_confirmation)
 
-                # Проверяем, что дата окончания не раньше даты начала
-                if end_date < start_date:
-                    await message.answer("❌ Дата окончания не может быть раньше даты начала. Введите корректную дату:")
-                    return
-
-                # Выполняем экспорт
-                await message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
-                csv_blob = await self.supabase.export_expenses_csv(
-                    message.from_user.id,
-                    start_date=start_date,
-                    end_date=end_date
-                )
-                
-                filename = f"expensecat_export_{start_date}_{end_date}.csv"
-                # Форматируем даты для отображения
-                try:
-                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
-                except:
-                    period_text = f"{start_date} - {end_date}"
-                
-                file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
-                await message.answer_document(
-                    document=file,
-                    caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
-                )
-                await state.clear()
-            except ValueError:
-                await message.answer(
-                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2025):"
-                )
-        
+        # Обработчики состояний для отчетов - должны быть ПЕРЕД общим F.text обработчиком
         @self.router.message(ReportStates.waiting_for_start_date)
         async def handle_report_start_date(message: Message, state: FSMContext) -> None:
             """Обработчик ввода даты начала периода"""
@@ -3835,6 +3801,58 @@ class ExpenseCatBot:
                 await message.answer(
                     "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2025):"
                 )
+
+        @self.router.message(ReportStates.waiting_for_single_date)
+        async def handle_report_single_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты для отчета за один день"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                single_date = date_obj.strftime("%Y-%m-%d")
+                
+                # Используем одну и ту же дату как начало и конец периода
+                start_date = single_date
+                end_date = single_date
+
+                # Получаем отчет
+                report = await self.supabase.fetch_monthly_report(
+                    message.from_user.id,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                # Форматируем отчет с разбивкой
+                report_text = format_report(report)
+                
+                # Обрезаем если слишком длинный
+                truncated_report = truncate_message_for_telegram(report_text)
+                await message.answer(truncated_report)
+                await state.clear()
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 15.12.2025):"
+                )
+
+        # Обработчики команд должны быть ПЕРЕД общим F.text обработчиком
+        @self.router.message(Command("feedback"))
+        async def handle_feedback(message: Message, state: FSMContext) -> None:
+            """Обработчик команды для обратной связи"""
+            await state.set_state(FeedbackStates.waiting_for_feedback_type)
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🐛 Сообщить об ошибке", callback_data="feedback_bug"),
+                ],
+                [
+                    InlineKeyboardButton(text="💡 Предложить функцию", callback_data="feedback_suggestion"),
+                    InlineKeyboardButton(text="😞 Пожаловаться", callback_data="feedback_complaint"),
+                ],
+            ])
+            
+            await message.answer(
+                "📢 Выберите тип обратной связи:",
+                reply_markup=keyboard
+            )
 
         @self.router.message(Command("delete_all"))
         async def handle_delete_all(message: Message, state: FSMContext) -> None:
@@ -4003,44 +4021,6 @@ class ExpenseCatBot:
                 logging.exception(f"Error in handle_delete_expense: {exc}")
                 await message.answer(f"❌ Ошибка при получении списка расходов: {str(exc)[:200]}")
 
-        @self.router.message(Command("expense"))
-        async def handle_expense_entry(message: Message, state: FSMContext) -> None:
-            await state.clear()
-            
-            # Получаем валюту по умолчанию пользователя
-            default_currency = "RUB"
-            if self.supabase and message.from_user:
-                settings = await self.supabase.get_user_settings(message.from_user.id)
-                if settings and settings.get("default_currency"):
-                    default_currency = settings.get("default_currency")
-            
-            currency_symbols = {
-                "RUB": "₽",
-                "KZT": "₸",
-                "USD": "$",
-                "EUR": "€",
-                "GBP": "£",
-                "GEL": "₾",
-            }
-            default_symbol = currency_symbols.get(default_currency, default_currency)
-            
-            instructions = (
-                "💳 Добавление расхода вручную\n\n"
-                "Отправьте расход в формате:\n"
-                "• Название магазина/места сумма валюта\n"
-                "• Название магазина сумма валюта дата\n\n"
-                "Примеры:\n"
-                "• Кафе 500 руб\n"
-                "• Такси 1200 KZT\n"
-                "• Продукты 2500 руб 03.12\n"
-                "• Ресторан 5000 KZT 2025-12-03\n\n"
-                f"Валюта по умолчанию: {default_symbol} {default_currency}\n"
-                "Валюта определяется автоматически (RUB, KZT, USD и др.)\n"
-                "Если валюта не указана, используется валюта по умолчанию.\n"
-                "Если дата не указана, используется сегодняшняя."
-            )
-            await message.answer(instructions)
-
         @self.router.message(Command("settings"))
         async def handle_settings(message: Message, state: FSMContext) -> None:
             """Обработчик команды настроек"""
@@ -4071,34 +4051,724 @@ class ExpenseCatBot:
                 f"Выберите новую валюту:",
                 reply_markup=keyboard
             )
-            await state.set_state(SetupStates.waiting_for_currency)
+
+        # Обработчики состояний для feedback - должны быть ПЕРЕД общим F.text обработчиком
+        @self.router.message(FeedbackStates.waiting_for_feedback_text)
+        async def handle_feedback_text(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода текста обратной связи"""
+            if not message.text or message.text.startswith("/"):
+                await message.answer(
+                    "❌ Пожалуйста, отправьте текстовое сообщение. "
+                    "Используйте /cancel для отмены."
+                )
+                return
+            
+            feedback_text = message.text.strip()
+            data = await state.get_data()
+            feedback_type = data.get("feedback_type", "unknown")
+            
+            user_id = message.from_user.id if message.from_user else None
+            username = message.from_user.username if message.from_user else "unknown"
+            first_name = message.from_user.first_name if message.from_user else "unknown"
+            
+            type_names = {
+                "bug": "ошибка",
+                "suggestion": "предложение",
+                "complaint": "жалоба"
+            }
+            type_emojis = {
+                "bug": "🐛",
+                "suggestion": "💡",
+                "complaint": "😞"
+            }
+            
+            type_name = type_names.get(feedback_type, feedback_type)
+            emoji = type_emojis.get(feedback_type, "📝")
+            
+            # Логируем обратную связь
+            logging.info(
+                f"Feedback [{feedback_type}] from user_id={user_id} "
+                f"(@{username}, {first_name}): {feedback_text}"
+            )
+            
+            # Сохраняем в базу данных, если Supabase подключен
+            if self.supabase:
+                try:
+                    await self.supabase.save_feedback(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        feedback_text=feedback_text
+                    )
+                except Exception as exc:
+                    logging.exception(f"Ошибка при сохранении отзыва в базу данных: {exc}")
+            
+            # Отправляем в канал обратной связи, если настроен
+            if self.feedback_chat_id:
+                logging.info(f"📤 Sending feedback to channel: {self.feedback_chat_id}")
+                try:
+                    await self._send_feedback_to_channel(
+                        user_id=user_id,
+                        username=username,
+                        first_name=first_name,
+                        feedback_type=feedback_type,
+                        type_name=type_name,
+                        emoji=emoji,
+                        feedback_text=feedback_text
+                    )
+                    logging.info(f"✅ Feedback successfully sent to channel")
+                except Exception as exc:
+                    logging.exception(f"❌ Ошибка при отправке отзыва в канал: {exc}")
+            else:
+                logging.warning("⚠️ Feedback channel not configured (FEEDBACK_CHAT_ID not set), skipping channel send")
+            
+            await message.answer(
+                f"✅ Спасибо за вашу обратную связь!\n\n"
+                f"{emoji} Тип: {type_name}\n"
+                f"📝 Ваше сообщение:\n{feedback_text}\n\n"
+                "Мы обязательно рассмотрим ваше сообщение и учтём его при улучшении бота."
+            )
+            
+            await state.clear()
 
         @self.router.message(F.text)
-        async def handle_text_expense(message: Message, state: FSMContext) -> None:
-            if not message.text or message.text.startswith("/"):
+        async def handle_text_message(message: Message, state: FSMContext) -> None:
+            """Автоматическая обработка текстовых сообщений как ручного ввода расхода"""
+            # ВАЖНО: Команды должны обрабатываться отдельными обработчиками Command
+            # Проверяем команды в самом начале, чтобы не перехватывать их
+            if message.text and message.text.startswith("/"):
+                logging.info(f"📝 [TEXT_HANDLER] Skipping command: {message.text}")
+                return  # Команды обрабатываются отдельными обработчиками Command, не трогаем их
+            
+            logging.debug(f"📝 [TEXT_HANDLER] Processing text message: {message.text[:50] if message.text else 'None'}")
+            
+            # Проверяем, не находимся ли мы в специфическом состоянии (feedback, export, statement и т.д.)
+            current_state = await state.get_state()
+            
+            # Если находимся в состоянии ожидания текста расхода, используем существующий обработчик
+            if current_state == ExpenseStates.waiting_for_expense_text:
+                return  # Пусть существующий обработчик обработает
+            
+            # Если находимся в других специфических состояниях, не обрабатываем как расход
+            # НО: если пользователь в состоянии подтверждения или выбора категории и вводит новый текст,
+            # это должен быть новый расход (пользователь хочет начать заново)
+            if current_state:
+                state_name = str(current_state)
+                # Проверяем все возможные состояния, которые должны обрабатываться отдельно
+                # Исключаем ExpenseStates.waiting_for_confirmation и waiting_for_category - 
+                # если пользователь вводит новый текст в этих состояниях, это новый расход
+                if any(s in state_name for s in [
+                    "FeedbackStates", "ExportStates", "StatementStates", 
+                    "ReceiptStates", "SetupStates", "DeleteStates", 
+                    "DeleteExpenseStates", "ReportStates"
+                ]):
+                    return  # Не обрабатываем, пусть специфический обработчик обработает
+                
+                # Если пользователь в состоянии подтверждения или выбора категории, 
+                # и вводит новый текст - это новый расход, очищаем состояние
+                if current_state in [ExpenseStates.waiting_for_confirmation, ExpenseStates.waiting_for_category]:
+                    await state.clear()
+                    # Продолжаем обработку как новый расход
+            
+            # Если это обычный текст и мы не в специфическом состоянии, обрабатываем как ручной ввод расхода
+            if not message.text or not message.from_user:
                 return
             
             # Получаем валюту по умолчанию пользователя
             default_currency = "RUB"
-            if self.supabase and message.from_user:
+            if self.supabase:
                 settings = await self.supabase.get_user_settings(message.from_user.id)
                 if settings and settings.get("default_currency"):
                     default_currency = settings.get("default_currency")
             
-            parsed = parse_manual_expense(message.text, default_currency=default_currency)
+            # Парсим расход
+            logging.info(f"📝 [TEXT_HANDLER] Parsing expense: text='{message.text}', default_currency={default_currency}")
+            parsed = parse_manual_expense(message.text, default_currency)
             if not parsed:
+                # Если не удалось распознать, не отвечаем (может быть это просто сообщение)
+                logging.info(f"📝 [TEXT_HANDLER] Failed to parse expense from text: '{message.text}'")
                 return
+            
+            logging.info(f"📝 [TEXT_HANDLER] Successfully parsed expense: description='{parsed.description}', amount={parsed.amount}, currency={parsed.currency}")
+            
+            # Сохраняем распарсенные данные в состояние
+            await state.update_data(
+                parsed_expense=parsed,
+                expense_text=message.text
+            )
+            
+            # Показываем подтверждение распознавания (товар, цена, валюта)
+            currency_symbols = {
+                "RUB": "₽",
+                "KZT": "₸",
+                "USD": "$",
+                "EUR": "€",
+                "GBP": "£",
+                "GEL": "₾",
+            }
+            currency_symbol = currency_symbols.get(parsed.currency, parsed.currency)
+            
+            confirmation_text = (
+                f"📝 <b>Расход:</b> {parsed.description}\n"
+                f"💰 <b>Сумма:</b> {parsed.amount:.2f} {currency_symbol}\n"
+                f"📅 <b>Дата:</b> {parsed.occurred_at.strftime('%d.%m.%Y')}\n\n"
+                f"Всё верно?"
+            )
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Да, верно", callback_data="expense_confirm_parsed"),
+                    InlineKeyboardButton(text="❌ Нет, исправить", callback_data="expense_cancel")
+                ]
+            ])
+            
+            await message.answer(confirmation_text, reply_markup=keyboard, parse_mode="HTML")
+            await state.set_state(ExpenseStates.waiting_for_confirmation)
+
+        @self.router.callback_query(F.data.startswith("feedback_"))
+        async def handle_feedback_type(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик выбора типа обратной связи"""
+            await callback.answer()
+            
+            feedback_type = callback.data.replace("feedback_", "")
+            type_names = {
+                "bug": "ошибка",
+                "suggestion": "предложение",
+                "complaint": "жалоба"
+            }
+            type_emojis = {
+                "bug": "🐛",
+                "suggestion": "💡",
+                "complaint": "😞"
+            }
+            type_instructions = {
+                "bug": "Опишите ошибку подробно. Что вы делали, когда это произошло? Что должно было произойти и что произошло на самом деле?",
+                "suggestion": "Опишите вашу идею подробно. Какую функцию вы хотели бы видеть в боте?",
+                "complaint": "Опишите проблему, с которой вы столкнулись. Что вас не устраивает?"
+            }
+            
+            type_name = type_names.get(feedback_type, feedback_type)
+            emoji = type_emojis.get(feedback_type, "📝")
+            instruction = type_instructions.get(feedback_type, "Опишите проблему подробно.")
+            
+            await state.update_data(feedback_type=feedback_type)
+            await state.set_state(FeedbackStates.waiting_for_feedback_text)
+            
+            await callback.message.answer(
+                f"{emoji} Вы выбрали: {type_name}\n\n{instruction}"
+            )
+
+        @self.router.message(Command("import"))
+        async def handle_import(message: Message, state: FSMContext) -> None:
             await state.clear()
-            await message.answer(format_manual_summary(parsed))
-            if not self.supabase or not message.from_user:
+            await message.answer(
+                "Для импорта пришли CSV/XLSX/PDF выписку или отчёт из другого сервиса. "
+                "Мы автоматически распознаем формат и подскажем, что делать дальше."
+            )
+
+        # Обработчик выбора валюты должен быть ПЕРЕД общим обработчиком report_,
+        # чтобы перехватывать callback'и report_currency_* первым
+        @self.router.callback_query(F.data.startswith("report_currency_"))
+        async def handle_report_currency(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик выбора валюты для отчета"""
+            try:
+                await callback.answer()
+                logging.info(f"📊 [REPORT_CURRENCY] Callback received: {callback.data} from user {callback.from_user.id if callback.from_user else 'unknown'}")
+                
+                if not callback.from_user:
+                    await callback.message.answer("❌ Ошибка: не удалось определить пользователя.")
+                    return
+                
+                # Получаем сохраненный отчет из состояния
+                state_data = await state.get_data()
+                report = state_data.get("report_data")
+                
+                if not report:
+                    await callback.message.answer("❌ Ошибка: данные отчета не найдены. Попробуйте выбрать период заново.")
+                    await state.clear()
+                    return
+            
+                selected_currency = callback.data.replace("report_currency_", "")
+                
+                # Форматируем отчет с учетом выбранной валюты
+                if selected_currency == "all":
+                    # Общий отчет - показываем все валюты
+                    report_text = format_report(report)
+                else:
+                    # Отчет для конкретной валюты - фильтруем данные
+                    filtered_report = {
+                        "period": report.get("period", ""),
+                        "currencies_data": {
+                            selected_currency: report.get("currencies_data", {}).get(selected_currency, {})
+                        },
+                        "most_expensive_by_currency": {
+                            selected_currency: report.get("most_expensive_by_currency", {}).get(selected_currency, {})
+                        }
+                    }
+                    report_text = format_report(filtered_report)
+                
+                if not report_text or not report_text.strip():
+                    await callback.message.answer("📊 Нет данных за выбранный период.")
+                    await state.clear()
+                    return
+                
+                # Обрезаем если слишком длинный
+                truncated_report = truncate_message_for_telegram(report_text)
+                await callback.message.answer(truncated_report)
+                await state.clear()
+                logging.info(f"✅ Report sent successfully to user {callback.from_user.id} for currency {selected_currency}")
+            except Exception as exc:
+                logging.exception(f"Error in handle_report_currency: {exc}")
+                try:
+                    await callback.message.answer(f"❌ Ошибка при получении отчета: {str(exc)[:200]}")
+                except:
+                    logging.error("Failed to send error message to user")
+        
+        @self.router.callback_query(F.data.startswith("report_"))
+        async def handle_report_period(callback: CallbackQuery, state: FSMContext) -> None:
+            try:
+                logging.info(f"📊 [REPORT_CALLBACK] Callback received: {callback.data} from user {callback.from_user.id if callback.from_user else 'unknown'}")
+                logging.info(f"📊 [REPORT_CALLBACK] Callback object: {callback}")
+                await callback.answer()
+                logging.info(f"📊 [REPORT_CALLBACK] Callback answered")
+                
+                if not self.supabase:
+                    logging.warning("📊 [REPORT_CALLBACK] Supabase not available for report")
+                    await callback.message.answer("Отчёты по расходам появятся после подключения базы (Supabase).")
+                    return
+            
+                if not callback.from_user:
+                    logging.warning("📊 [REPORT_CALLBACK] No user in callback for report")
+                    await callback.message.answer("❌ Ошибка: не удалось определить пользователя.")
+                    return
+                
+                now = datetime.utcnow()
+                period = None
+                start_date = None
+                end_date = None
+            
+                if callback.data == "report_current_month":
+                    period = now.strftime("%Y-%m")
+                    logging.info(f"Report period: current month = {period}")
+                elif callback.data == "report_last_month":
+                    # Прошлый месяц
+                    last_month = (now.replace(day=1) - timedelta(days=1))
+                    period = last_month.strftime("%Y-%m")
+                    logging.info(f"Report period: last month = {period}")
+                elif callback.data == "report_current_week":
+                    # Текущая неделя (понедельник - воскресенье)
+                    days_since_monday = now.weekday()
+                    start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
+                    # Вычисляем воскресенье текущей недели (6 - weekday() дней до воскресенья)
+                    days_until_sunday = 6 - now.weekday()
+                    end_date = (now + timedelta(days=days_until_sunday)).strftime("%Y-%m-%d")
+                    logging.info(f"Report period: current week = {start_date} to {end_date}")
+                elif callback.data == "report_last_week":
+                    # Прошлая неделя
+                    days_since_monday = now.weekday()
+                    week_start = now - timedelta(days=days_since_monday + 7)
+                    week_end = now - timedelta(days=days_since_monday + 1)
+                    start_date = week_start.strftime("%Y-%m-%d")
+                    end_date = week_end.strftime("%Y-%m-%d")
+                    logging.info(f"Report period: last week = {start_date} to {end_date}")
+                elif callback.data == "report_current_year":
+                    # Текущий год
+                    start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                    end_date = now.strftime("%Y-%m-%d")
+                    logging.info(f"Report period: current year = {start_date} to {end_date}")
+                elif callback.data == "report_custom":
+                    # Произвольный период - запрашиваем даты
+                    logging.info("Report period: custom (requesting dates)")
+                    await callback.message.answer(
+                        "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
+                    )
+                    await state.set_state(ReportStates.waiting_for_start_date)
+                    return
+                elif callback.data == "report_single_day":
+                    # Отчет за один день - запрашиваем одну дату
+                    logging.info("Report period: single day (requesting date)")
+                    await callback.message.answer(
+                        "📅 Введите дату в формате ДД.ММ.ГГГГ (например, 15.12.2025):"
+                    )
+                    await state.set_state(ReportStates.waiting_for_single_date)
+                    return
+                else:
+                    # Проверяем, может быть это callback для выбора валюты
+                    if callback.data.startswith("report_currency_"):
+                        logging.info(f"📊 [REPORT_CALLBACK] Currency selection callback detected: {callback.data}, but handler may not be registered correctly")
+                        # Пробуем обработать через обработчик валют
+                        await callback.answer("Обрабатываю выбор валюты...")
+                        # Передаем управление обработчику валют
+                        return
+                    logging.warning(f"Unknown report period: {callback.data}")
+                    logging.warning(f"📊 [REPORT_CALLBACK] Full callback data: {callback.data}, callback type: {type(callback.data)}")
+                    await callback.message.answer("❌ Неизвестный период для отчета.")
+                    return
+            
+                # Получаем отчет для проверки валют
+                logging.info(f"Fetching report for user {callback.from_user.id}: period={period}, start_date={start_date}, end_date={end_date}")
+                report_start = time.perf_counter()
+                report = await self.supabase.fetch_monthly_report(
+                    callback.from_user.id, 
+                    period=period,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                report_time = time.perf_counter() - report_start
+                logging.info(f"⏱️ [PERF] Report fetched in {report_time*1000:.1f}ms ({report_time:.2f}s)")
+                
+                if not report:
+                    logging.warning(f"Empty report returned for user {callback.from_user.id}")
+                    await callback.message.answer("📊 Нет данных за выбранный период.")
+                    return
+                
+                currencies_data = report.get("currencies_data", {})
+                currencies_list = list(currencies_data.keys())
+                
+                logging.info(f"📊 [REPORT_CALLBACK] Found currencies in report: {currencies_list}, count: {len(currencies_list)}")
+                logging.info(f"📊 [REPORT_CALLBACK] Currencies data keys: {list(currencies_data.keys())}")
+                
+                # Если несколько валют - предлагаем выбрать валюту или общий отчет
+                if len(currencies_list) > 1:
+                    logging.info(f"📊 [REPORT_CALLBACK] Multiple currencies detected, showing currency selection menu")
+                    # Сохраняем отчет в состояние для последующего использования
+                    await state.update_data(
+                        report_data=report,
+                        report_period=period,
+                        report_start_date=start_date,
+                        report_end_date=end_date
+                    )
+                    
+                    # Создаем клавиатуру с валютами и опцией "общий отчет"
+                    currency_symbols = {
+                        "RUB": "₽",
+                        "KZT": "₸",
+                        "USD": "$",
+                        "EUR": "€",
+                        "GBP": "£",
+                        "GEL": "₾",
+                    }
+                    
+                    keyboard_buttons = []
+                    # Добавляем кнопки для каждой валюты
+                    for currency in sorted(currencies_list):
+                        symbol = currency_symbols.get(currency, currency)
+                        total = currencies_data[currency].get("total", 0.0)
+                        keyboard_buttons.append([
+                            InlineKeyboardButton(
+                                text=f"{symbol} {total:.2f}",
+                                callback_data=f"report_currency_{currency}"
+                            )
+                        ])
+                    
+                    # Добавляем кнопку "общий отчет"
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(
+                            text="🌍 Общий отчет (все валюты)",
+                            callback_data="report_currency_all"
+                        )
+                    ])
+                    
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                    
+                    await callback.message.answer(
+                        "💰 За выбранный период есть траты в разных валютах.\n"
+                        "Выберите валюту для отчета или общий отчет:",
+                        reply_markup=keyboard
+                    )
+                    await state.set_state(ReportStates.waiting_for_currency)
+                    return
+                
+                # Если одна валюта - сразу показываем отчет
+                logging.info(f"Formatting report: period={report.get('period')}, currencies={currencies_list}")
+                report_text = format_report(report)
+                
+                if not report_text or not report_text.strip():
+                    logging.warning(f"Empty report text after formatting for user {callback.from_user.id}")
+                    await callback.message.answer("📊 Нет данных за выбранный период.")
+                    return
+                
+                # Обрезаем если слишком длинный
+                truncated_report = truncate_message_for_telegram(report_text)
+                logging.info(f"Sending report to user {callback.from_user.id}: {len(truncated_report)} chars")
+                await callback.message.answer(truncated_report)
+                logging.info(f"✅ Report sent successfully to user {callback.from_user.id}")
+            except Exception as exc:
+                logging.exception(f"Error in handle_report_period: {exc}")
+                try:
+                    await callback.message.answer(f"❌ Ошибка при получении отчета: {str(exc)[:200]}")
+                except:
+                    logging.error("Failed to send error message to user")
+                await state.clear()
+        
+        @self.router.callback_query(F.data.startswith("export_"))
+        async def handle_export_period(callback: CallbackQuery, state: FSMContext) -> None:
+            await callback.answer()
+            
+            if not self.supabase:
+                await callback.message.answer("Экспорт доступен после подключения Supabase.")
                 return
-            # SECURITY: удостовериться, что пользователь подтверждён, прежде чем писать в базу.
-            payload = build_manual_expense_payload(message.from_user.id, parsed)
-            expense_result = await self.supabase.record_expense(payload)
-            if expense_result.get("duplicate"):
-                await message.answer("⚠️ Расход не добавлен: найден дубликат с такой же датой и суммой.")
+            
+            now = datetime.utcnow()
+            period = None
+            start_date = None
+            end_date = None
+            
+            if callback.data == "export_current_month":
+                period = now.strftime("%Y-%m")
+            elif callback.data == "export_last_month":
+                # Прошлый месяц
+                last_month = (now.replace(day=1) - timedelta(days=1))
+                period = last_month.strftime("%Y-%m")
+            elif callback.data == "export_current_week":
+                # Текущая неделя (понедельник - воскресенье)
+                days_since_monday = now.weekday()
+                start_date = (now - timedelta(days=days_since_monday)).strftime("%Y-%m-%d")
+                # Вычисляем воскресенье текущей недели (6 - weekday() дней до воскресенья)
+                days_until_sunday = 6 - now.weekday()
+                end_date = (now + timedelta(days=days_until_sunday)).strftime("%Y-%m-%d")
+            elif callback.data == "export_last_week":
+                # Прошлая неделя
+                days_since_monday = now.weekday()
+                week_start = now - timedelta(days=days_since_monday + 7)
+                week_end = now - timedelta(days=days_since_monday + 1)
+                start_date = week_start.strftime("%Y-%m-%d")
+                end_date = week_end.strftime("%Y-%m-%d")
+            elif callback.data == "export_current_year":
+                # Текущий год
+                start_date = now.replace(month=1, day=1).strftime("%Y-%m-%d")
+                end_date = now.strftime("%Y-%m-%d")
+            elif callback.data == "export_custom":
+                # Произвольный период - запрашиваем даты
+                await callback.message.answer(
+                    "📅 Введите дату начала периода в формате ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+                await state.set_state(ExportStates.waiting_for_start_date)
+                return
+            elif callback.data == "export_all":
+                period = None
+                start_date = None
+                end_date = None
+            
+            # Выполняем экспорт
+            await callback.message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
+            csv_blob = await self.supabase.export_expenses_csv(
+                callback.from_user.id, 
+                period=period,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            # Формируем имя файла и описание периода
+            if period:
+                filename = f"expensecat_export_{period}.csv"
+                # Форматируем период для отображения
+                try:
+                    date_obj = datetime.strptime(period, "%Y-%m")
+                    months = ["январь", "февраль", "март", "апрель", "май", "июнь",
+                             "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+                    month_name = months[date_obj.month - 1]
+                    period_text = f"{month_name} {date_obj.year}"
+                except:
+                    period_text = period
+            elif start_date and end_date:
+                filename = f"expensecat_export_{start_date}_{end_date}.csv"
+                # Форматируем даты для отображения
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
+                except:
+                    period_text = f"{start_date} - {end_date}"
             else:
-                await message.answer("✅ Расход добавлен вручную.")
+                filename = "expensecat_export_all.csv"
+                period_text = "все данные"
+            
+            file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
+            await callback.message.answer_document(
+                document=file,
+                caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
+            )
+            await state.clear()
+        
+        @self.router.message(ExportStates.waiting_for_start_date)
+        async def handle_export_start_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты начала периода для экспорта"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                start_date = date_obj.strftime("%Y-%m-%d")
+                await state.update_data(start_date=start_date)
+                await message.answer(
+                    "📅 Введите дату окончания периода в формате ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
+                await state.set_state(ExportStates.waiting_for_end_date)
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 01.12.2025):"
+                )
+        
+        @self.router.message(ExportStates.waiting_for_end_date)
+        async def handle_export_end_date(message: Message, state: FSMContext) -> None:
+            """Обработчик ввода даты окончания периода для экспорта"""
+            try:
+                # Парсим дату в формате ДД.ММ.ГГГГ
+                date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y")
+                end_date = date_obj.strftime("%Y-%m-%d")
+                data = await state.get_data()
+                start_date = data.get("start_date")
+                
+                if not start_date:
+                    await message.answer("❌ Ошибка: не найдена дата начала. Начните заново с /export")
+                    await state.clear()
+                    return
+
+                # Проверяем, что дата окончания не раньше даты начала
+                if end_date < start_date:
+                    await message.answer("❌ Дата окончания не может быть раньше даты начала. Введите корректную дату:")
+                    return
+
+                # Выполняем экспорт
+                await message.answer("📤 Формирую выгрузку, это может занять пару секунд…")
+                csv_blob = await self.supabase.export_expenses_csv(
+                    message.from_user.id,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                
+                filename = f"expensecat_export_{start_date}_{end_date}.csv"
+                # Форматируем даты для отображения
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                    period_text = f"{start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}"
+                except:
+                    period_text = f"{start_date} - {end_date}"
+                
+                file = BufferedInputFile(csv_blob.encode("utf-8"), filename=filename)
+                await message.answer_document(
+                    document=file,
+                    caption=f"✅ Готово. Период: {period_text}\n\nИспользуй CSV в Excel/Sheets или импортируй обратно.",
+                )
+                await state.clear()
+            except ValueError:
+                await message.answer(
+                    "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ (например, 31.12.2025):"
+                )
+
+        @self.router.callback_query(F.data == "expense_confirm_parsed", ExpenseStates.waiting_for_confirmation)
+        async def handle_expense_confirm_parsed(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик подтверждения распознавания расхода"""
+            await callback.answer()
+            
+            # Получаем распарсенные данные из состояния
+            data = await state.get_data()
+            parsed = data.get("parsed_expense")
+            
+            if not parsed:
+                await callback.message.answer("❌ Ошибка: данные расхода не найдены. Начните заново с /expense")
+                await state.clear()
+                return
+            
+            # Показываем клавиатуру с категориями
+            currency_symbols = {
+                "RUB": "₽",
+                "KZT": "₸",
+                "USD": "$",
+                "EUR": "€",
+                "GBP": "£",
+                "GEL": "₾",
+            }
+            currency_symbol = currency_symbols.get(parsed.currency, parsed.currency)
+            
+            summary_text = (
+                f"📝 Расход: {parsed.description}\n"
+                f"💰 Сумма: {parsed.amount:.2f} {currency_symbol}\n"
+                f"📅 Дата: {parsed.occurred_at.strftime('%d.%m.%Y')}\n\n"
+                f"Выберите категорию расхода:"
+            )
+            
+            keyboard = self._create_category_keyboard()
+            await callback.message.edit_text(summary_text, reply_markup=keyboard)
+            await state.set_state(ExpenseStates.waiting_for_category)
+        
+        @self.router.callback_query(F.data.startswith("expense_category_"), ExpenseStates.waiting_for_category)
+        async def handle_expense_category(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик выбора категории расхода"""
+            await callback.answer()
+            
+            if not callback.from_user or not self.supabase:
+                await callback.message.answer("❌ Ошибка: база данных недоступна.")
+                await state.clear()
+                return
+            
+            # Извлекаем категорию из callback_data
+            category = callback.data.replace("expense_category_", "")
+            
+            # Получаем распарсенные данные из состояния
+            data = await state.get_data()
+            parsed = data.get("parsed_expense")
+            
+            if not parsed:
+                await callback.message.answer("❌ Ошибка: данные расхода не найдены. Начните заново с /expense")
+                await state.clear()
+                return
+            
+            # Устанавливаем категорию
+            parsed.category = category
+            
+            # Сохраняем расход в базу сразу после выбора категории
+            try:
+                payload = build_manual_expense_payload(callback.from_user.id, parsed)
+                result = await self.supabase.record_expense(payload, check_duplicates=True)
+                
+                currency_symbols = {
+                    "RUB": "₽",
+                    "KZT": "₸",
+                    "USD": "$",
+                    "EUR": "€",
+                    "GBP": "£",
+                    "GEL": "₾",
+                }
+                currency_symbol = currency_symbols.get(parsed.currency, parsed.currency)
+                
+                await callback.message.edit_text(
+                    f"✅ <b>Расход добавлен!</b>\n\n"
+                    f"📝 {parsed.description}\n"
+                    f"💰 {parsed.amount:.2f} {currency_symbol}\n"
+                    f"📂 {category}\n"
+                    f"📅 {parsed.occurred_at.strftime('%d.%m.%Y')}",
+                    parse_mode="HTML"
+                )
+                logging.info(f"Manual expense saved: user={callback.from_user.id}, amount={parsed.amount}, category={category}")
+            except Exception as exc:
+                logging.exception(f"Error saving manual expense: {exc}")
+                await callback.message.edit_text(f"❌ Ошибка при сохранении расхода: {str(exc)[:200]}")
+            
+            await state.clear()
+        
+        @self.router.callback_query(F.data == "expense_cancel")
+        async def handle_expense_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+            """Обработчик отмены добавления расхода"""
+            await callback.answer("Отменено")
+            current_state = await state.get_state()
+            if current_state == ExpenseStates.waiting_for_confirmation:
+                # Если отменяем на этапе подтверждения распознавания, предлагаем ввести заново
+                await callback.message.edit_text(
+                    "❌ Распознавание отменено.\n\n"
+                    "Введите расход заново в формате:\n"
+                    "• кофе 1300\n"
+                    "• автосервис 10к\n"
+                    "• такси 1200 KZT"
+                )
+                await state.set_state(ExpenseStates.waiting_for_expense_text)
+            else:
+                # Если отменяем на этапе выбора категории, просто отменяем
+                await callback.message.edit_text("❌ Добавление расхода отменено.")
+                await state.clear()
+            await state.set_state(SetupStates.waiting_for_currency)
+
 
         @self.router.callback_query(F.data == "receipt_confirm")
         async def handle_receipt_confirm(callback: CallbackQuery, state: FSMContext) -> None:
@@ -5759,13 +6429,34 @@ def generate_receipt_image(parsed: ParsedReceipt) -> Optional[bytes]:
         return None
 
 
-def format_report(report: Dict[str, Any]) -> str:
+def format_report(report: Dict[str, Any], currency: Optional[str] = None) -> str:
     """
     Форматирует отчет с разбивкой по категориям, топ категорий/магазинов.
     Поддерживает мультивалютные отчеты.
+    
+    Args:
+        report: Словарь с данными отчета
+        currency: Опциональная валюта для фильтрации (если None, показываются все валюты)
     """
+    if not report:
+        logging.warning("format_report: empty report provided")
+        return "📊 Нет данных за выбранный период."
+    
     period = report.get("period", "")
     currencies_data = report.get("currencies_data", {})
+    
+    # Если указана конкретная валюта, фильтруем данные
+    if currency and currency != "all":
+        if currency in currencies_data:
+            currencies_data = {currency: currencies_data[currency]}
+        else:
+            # Если валюта не найдена, возвращаем пустой отчет
+            logging.info(f"format_report: currency {currency} not found in report")
+            return f"📊 Отчёт за {period}\n\n💰 Нет данных для валюты {currency} за выбранный период."
+    
+    if not currencies_data:
+        logging.info(f"format_report: no currencies data for period {period}")
+        return f"📊 Отчёт за {period}\n\n💰 Всего расходов: 0.00\n\nНет данных за выбранный период."
     
     # Форматируем период для отображения
     display_period = period
@@ -5802,37 +6493,36 @@ def format_report(report: Dict[str, Any]) -> str:
         "GEL": "₾",
     }
     
-    # Если есть несколько валют, показываем отдельно по каждой
-    if len(currencies_data) > 1:
-        lines.append("💰 Итого по валютам:")
+    # Всего расходов - всегда показываем по каждой валюте отдельно
+    lines.append("💰 Всего расходов:")
+    if currencies_data:
         for currency in sorted(currencies_data.keys()):
             currency_info = currencies_data[currency]
             total = currency_info.get("total", 0.0)
             symbol = currency_symbols.get(currency, currency)
             lines.append(f"  {symbol} {total:.2f}")
-        lines.append("")
-    elif len(currencies_data) == 1:
-        # Одна валюта - показываем просто итог
-        currency = list(currencies_data.keys())[0]
-        currency_info = currencies_data[currency]
-        total = currency_info.get("total", 0.0)
-        symbol = currency_symbols.get(currency, currency)
-        lines.append(f"💰 Всего расходов: {total:.2f} {symbol}")
-        lines.append("")
     else:
-        # Нет данных
-        lines.append("💰 Всего расходов: 0.00")
+        lines.append("  0.00")
     lines.append("")
     
-    # Самая дорогая покупка и самый дорогой расход
-    most_expensive_item = report.get("most_expensive_item")
-    most_expensive_expense = report.get("most_expensive_expense")
+    # Топы по каждой валюте отдельно
+    # Итерируемся по всем валютам из топов (может быть больше чем в currencies_data)
+    most_expensive_by_currency = report.get("most_expensive_by_currency", {})
     
-    if most_expensive_item and most_expensive_item.get("name"):
-        item_name = most_expensive_item.get("name", "Неизвестно")
-        item_price = most_expensive_item.get("price", 0.0)
-        item_store = most_expensive_item.get("store", "Неизвестно")
-        item_date = most_expensive_item.get("date", "")
+    # Объединяем валюты из currencies_data и most_expensive_by_currency
+    all_currencies = set(currencies_data.keys()) | set(most_expensive_by_currency.keys())
+    
+    for currency in sorted(all_currencies):
+        currency_tops = most_expensive_by_currency.get(currency, {})
+        symbol = currency_symbols.get(currency, currency)
+        
+        # Самая дорогая покупка для этой валюты
+        item_info = currency_tops.get("item", {})
+        if item_info.get("name") and item_info.get("price", 0) > 0:
+            item_name = item_info.get("name", "Неизвестно")
+            item_price = item_info.get("price", 0.0)
+            item_store = item_info.get("store", "Неизвестно")
+            item_date = item_info.get("date", "")
         
         # Форматируем дату
         date_str = ""
@@ -5847,37 +6537,50 @@ def format_report(report: Dict[str, Any]) -> str:
                 date_str = item_date[:10] if len(item_date) >= 10 else item_date
         
         store_name = item_store[:30] if len(item_store) > 30 else item_store
-        item_currency = most_expensive_item.get("currency", "RUB")
-        item_symbol = currency_symbols.get(item_currency, item_currency)
-        lines.append("💎 Самая дорогая покупка:")
-        if date_str:
-            lines.append(f"  {item_name} - {item_price:.2f} {item_symbol} ({store_name}, {date_str})")
+        
+        # Показываем заголовок только если несколько валют
+        if len(currencies_data) > 1:
+            lines.append(f"💎 Самая дорогая покупка ({symbol}):")
         else:
-            lines.append(f"  {item_name} - {item_price:.2f} {item_symbol} ({store_name})")
+            lines.append("💎 Самая дорогая покупка:")
+        
+        if date_str:
+            lines.append(f"  {item_name} - {item_price:.2f} {symbol} ({store_name}, {date_str})")
+        else:
+            lines.append(f"  {item_name} - {item_price:.2f} {symbol} ({store_name})")
         lines.append("")
     
-    if most_expensive_expense and most_expensive_expense.get("amount", 0) > 0:
-        exp_amount = most_expensive_expense.get("amount", 0.0)
-        exp_store = most_expensive_expense.get("store", "Неизвестно")
-        exp_date = most_expensive_expense.get("date", "")
-        exp_currency = most_expensive_expense.get("currency", "RUB")
-        exp_symbol = currency_symbols.get(exp_currency, exp_currency)
+        # Самый дорогой расход для этой валюты
+        expense_info = currency_tops.get("expense", {})
+        if expense_info.get("amount", 0) > 0:
+            exp_amount = expense_info.get("amount", 0.0)
+            exp_store = expense_info.get("store", "Неизвестно")
+            exp_date = expense_info.get("date", "")
         
         # Форматируем дату
         date_str = ""
         if exp_date:
             try:
-                date_obj = datetime.strptime(exp_date[:10], "%Y-%m-%d")
+                if "T" in exp_date:
+                    date_obj = datetime.fromisoformat(exp_date.replace("Z", "+00:00"))
+                else:
+                    date_obj = datetime.strptime(exp_date[:10], "%Y-%m-%d")
                 date_str = date_obj.strftime("%d.%m.%Y")
             except:
                 date_str = exp_date[:10] if len(exp_date) >= 10 else exp_date
         
         store_name = exp_store[:30] if len(exp_store) > 30 else exp_store
-        lines.append("💸 Самый дорогой расход:")
-        if date_str:
-            lines.append(f"  {exp_amount:.2f} {exp_symbol} - {store_name} ({date_str})")
+        
+        # Показываем заголовок только если несколько валют
+        if len(currencies_data) > 1:
+            lines.append(f"💸 Самый дорогой расход ({symbol}):")
         else:
-            lines.append(f"  {exp_amount:.2f} {exp_symbol} - {store_name}")
+            lines.append("💸 Самый дорогой расход:")
+        
+        if date_str:
+            lines.append(f"  {exp_amount:.2f} {symbol} - {store_name} ({date_str})")
+        else:
+            lines.append(f"  {exp_amount:.2f} {symbol} - {store_name}")
         lines.append("")
     
     # Формируем отчет по каждой валюте отдельно
@@ -5893,27 +6596,15 @@ def format_report(report: Dict[str, Any]) -> str:
             lines.append(f"━━━ {symbol} ━━━")
             lines.append(f"💰 Итого: {total:.2f} {symbol}")
         lines.append("")
-    
-    # Разбивка по категориям
-    if by_category:
-        lines.append("📂 По категориям:")
-        sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
-        for category, amount in sorted_categories[:10]:  # Топ 10
-            percentage = (amount / total * 100) if total > 0 else 0
-            lines.append(f"  • {category}: {amount:.2f} {symbol} ({percentage:.1f}%)")
-        lines.append("")
-    
-    # Топ магазинов
-    if by_store:
-        lines.append("🏪 Топ магазинов:")
-        sorted_stores = sorted(by_store.items(), key=lambda x: x[1], reverse=True)
-        for store, amount in sorted_stores[:5]:  # Топ 5
-            percentage = (amount / total * 100) if total > 0 else 0
-            # Нормализуем название магазина для отображения
-            store_name = normalize_store_name(store)
-            store_name = store_name[:40] if len(store_name) > 40 else store_name
-            lines.append(f"  • {store_name}: {amount:.2f} {symbol} ({percentage:.1f}%)")
-        lines.append("")
+        
+        # Разбивка по категориям для этой валюты
+        if by_category:
+            lines.append("📂 По категориям:")
+            sorted_categories = sorted(by_category.items(), key=lambda x: x[1], reverse=True)
+            for category, amount in sorted_categories[:10]:  # Топ 10
+                percentage = (amount / total * 100) if total > 0 else 0
+                lines.append(f"  • {category}: {amount:.2f} {symbol} ({percentage:.1f}%)")
+            lines.append("")
     
     return "\n".join(lines)
 
@@ -9704,8 +10395,31 @@ def _first_value(row: Dict[str, Any], keys: tuple) -> Optional[str]:
     return None
 
 
+# Словарь вариантов написания тысяч для разных валют
+_THOUSAND_VARIANTS = {
+    "RUB": ["т.р", "т р", "тр", "тыс руб", "тыс.руб", "тысяч руб", "тысяч рублей", "тыс. рублей", "тыс р", "тыс.р"],
+    "KZT": ["т.тг", "т тг", "ттг", "тыс тг", "тыс.тг", "тысяч тг", "тысяч тенге", "тыс. тенге", "тыс т", "тыс.т"],
+    "USD": ["тыс долл", "тыс.долл", "тысяч долл", "тысяч долларов", "тыс. долларов", "тыс usd", "тыс.usd", "тысяч usd", "тыс $", "тыс.$", "т.долл", "т долл", "тдолл", "thousand usd", "k usd", "k$"],
+    "EUR": ["тыс евро", "тыс.евро", "тысяч евро", "тысяч евр", "тыс. евро", "тыс eur", "тыс.eur", "тысяч eur", "тыс €", "тыс.€", "т.евро", "т евро", "тевро", "thousand eur", "k eur", "k€"],
+    "GBP": ["тыс фунт", "тыс.фунт", "тысяч фунт", "тысяч фунтов", "тыс. фунтов", "тыс gbp", "тыс.gbp", "тысяч gbp", "тыс £", "тыс.£", "т.фунт", "т фунт", "тфунт", "thousand gbp", "k gbp", "k£"],
+    "GEL": ["тыс лари", "тыс.лари", "тысяч лари", "тыс gel", "тыс.gel", "тысяч gel", "тыс ₾", "тыс.₾", "т.лари", "т лари", "тлари", "k gel", "k₾"],
+    "BYN": ["тыс бел", "тыс.бел", "тысяч бел", "тысяч белорусских", "тыс byn", "тыс.byn", "тысяч byn", "т.бел", "т бел", "тбел", "k byn"],
+    "KGS": ["тыс сом", "тыс.сом", "тысяч сом", "тысяч сомов", "тыс kgs", "тыс.kgs", "тысяч kgs", "т.сом", "т сом", "тсом", "k kgs"],
+    "CNY": ["тыс юань", "тыс.юань", "тысяч юань", "тысяч юаней", "тыс cny", "тыс.cny", "тысяч cny", "тыс ¥", "тыс.¥", "т.юань", "т юань", "тюань", "k cny", "k¥"],
+    "CHF": ["тыс франк", "тыс.франк", "тысяч франк", "тысяч франков", "тыс chf", "тыс.chf", "тысяч chf", "т.франк", "т франк", "тфранк", "k chf"],
+    "AED": ["тыс дирх", "тыс.дирх", "тысяч дирх", "тысяч дирхамов", "тыс aed", "тыс.aed", "тысяч aed", "т.дирх", "т дирх", "тдирх", "k aed"],
+    "CAD": ["тыс канад", "тыс.канад", "тысяч канад", "тысяч канадских", "тыс cad", "тыс.cad", "тысяч cad", "т.канад", "т канад", "тканад", "k cad"],
+    "AUD": ["тыс австрал", "тыс.австрал", "тысяч австрал", "тысяч австралийских", "тыс aud", "тыс.aud", "тысяч aud", "т.австрал", "т австрал", "тавстрал", "k aud"],
+}
+
+# Создаем общий паттерн для всех вариантов тысяч
+_thousand_pattern = "|".join([
+    "к", "k", "тыс", "тысяч", "thousand",
+    *[re.escape(v) for variants in _THOUSAND_VARIANTS.values() for v in variants]
+])
+
 MANUAL_AMOUNT_PATTERN = re.compile(
-    r"(?P<amount>-?\d+[.,]?\d{0,2})\s*(?P<currency>₽|р\.?|руб|rub|₸|тг|kzt|\$|usd|eur|€|byn|сом|kgs)?",
+    r"(?P<amount>-?\d+[.,]?\d{0,2})\s*(?P<multiplier>" + _thousand_pattern + r")?\s*(?P<currency>₽|р\.?|руб|rub|₸|тг|kzt|\$|usd|eur|€|byn|сом|kgs|gbp|£|gel|₾|cny|¥|chf|aed|cad|aud)?",
     re.IGNORECASE,
 )
 MANUAL_DATE_PATTERN = re.compile(r"(\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)")
@@ -9718,10 +10432,41 @@ def parse_manual_expense(text: str, default_currency: str = "RUB") -> Optional[P
     amount_match = MANUAL_AMOUNT_PATTERN.search(cleaned)
     if not amount_match:
         return None
+    
+    # Логируем для отладки
+    logging.debug(f"parse_manual_expense: input='{text}', cleaned='{cleaned}', amount_match='{amount_match.group(0)}'")
     amount = safe_float(amount_match.group("amount"))
+    
+    # Обработка множителя (тысячи для всех валют)
+    multiplier = amount_match.group("multiplier")
+    currency_from_multiplier = None
+    
+    if multiplier:
+        multiplier_lower = multiplier.lower().strip()
+        # Проверяем общие варианты (к, k, тыс, тысяч, thousand)
+        if multiplier_lower in ("к", "k", "тыс", "тысяч", "thousand"):
+            amount = amount * 1000
+        else:
+            # Проверяем варианты для конкретных валют
+            for currency_code, variants in _THOUSAND_VARIANTS.items():
+                for variant in variants:
+                    # Нормализуем вариант (убираем точки и пробелы для сравнения)
+                    variant_normalized = re.sub(r'[.\s]+', '', variant.lower())
+                    multiplier_normalized = re.sub(r'[.\s]+', '', multiplier_lower)
+                    
+                    # Проверяем точное совпадение или вхождение
+                    if variant_normalized == multiplier_normalized or variant.lower() in multiplier_lower:
+                        amount = amount * 1000
+                        currency_from_multiplier = currency_code
+                        break
+                if currency_from_multiplier:
+                    break
+    
     token_currency = amount_match.group("currency") or ""
+    
     detected_currency = (
-        _currency_from_value(token_currency)
+        currency_from_multiplier
+        or _currency_from_value(token_currency)
         or _currency_from_value(cleaned)
         or default_currency
     )
@@ -9729,16 +10474,48 @@ def parse_manual_expense(text: str, default_currency: str = "RUB") -> Optional[P
     occurred_at = (
         _parse_manual_date(date_match.group(1)) if date_match else datetime.utcnow()
     )
-    store_text = cleaned
-    store_text = store_text.replace(amount_match.group(0), "", 1)
+    # Извлекаем описание (все, что не сумма, множитель и не дата)
+    # Находим позицию суммы в тексте
+    amount_start = amount_match.start()
+    amount_end = amount_match.end()
+    amount_full_match = amount_match.group(0)
+    
+    # Если сумма в начале текста, описание - это всё после суммы
+    if amount_start == 0:
+        description_text = cleaned[amount_end:].strip()
+    # Если сумма в конце текста, описание - это всё до суммы
+    elif amount_end >= len(cleaned):
+        description_text = cleaned[:amount_start].strip()
+    # Если сумма в середине, берём всё до суммы (описание обычно идёт перед суммой)
+    else:
+        description_text = cleaned[:amount_start].strip()
+    
+    # Удаляем дату, если она была найдена
     if date_match:
-        store_text = store_text.replace(date_match.group(0), "", 1)
-    store = store_text.strip(" ,.-") or "Без описания"
+        date_match_text = date_match.group(0)
+        description_text = re.sub(re.escape(date_match_text), "", description_text, count=1)
+    
+    # Убираем валюту из описания, если она там есть отдельно (на случай, если она была написана отдельно от суммы)
+    if token_currency:
+        # Удаляем валюту только если она стоит отдельно (не часть другого слова)
+        currency_pattern = r'\b' + re.escape(token_currency) + r'\b'
+        description_text = re.sub(currency_pattern, "", description_text, count=1, flags=re.IGNORECASE)
+    
+    # Очищаем описание от лишних пробелов и знаков препинания
+    description = re.sub(r'\s+', ' ', description_text).strip(" ,.-")
+    # Если описание пустое или слишком короткое, используем значение по умолчанию
+    if not description or len(description) < 2:
+        description = "Без описания"
+    
+    # Логируем результат парсинга для отладки
+    logging.debug(f"parse_manual_expense: input='{text}', cleaned='{cleaned}', amount_match='{amount_full_match}' (pos {amount_start}-{amount_end}), description='{description}', amount={amount}, currency={detected_currency}")
+    
     return ParsedManualExpense(
-        store=store,
+        description=description,
         amount=amount,
         currency=detected_currency,
         occurred_at=occurred_at,
+        store=None,  # Магазин не определяется автоматически
         note=cleaned,
     )
 
@@ -9759,30 +10536,39 @@ def _parse_manual_date(token: str) -> datetime:
 
 
 def format_manual_summary(parsed: ParsedManualExpense) -> str:
-    return (
-        "Записал расход вручную:\n"
-        f"• Магазин: {parsed.store}\n"
-        f"• Дата: {parsed.occurred_at.strftime('%Y-%m-%d')}\n"
-        f"• Сумма: {parsed.amount:.2f} {parsed.currency}"
-    )
+    lines = [f"• Описание: {parsed.description}"]
+    if parsed.store:
+        lines.append(f"• Магазин: {parsed.store}")
+    lines.append(f"• Дата: {parsed.occurred_at.strftime('%Y-%m-%d')}")
+    lines.append(f"• Сумма: {parsed.amount:.2f} {parsed.currency}")
+    if parsed.category:
+        lines.append(f"• Категория: {parsed.category}")
+    return "\n".join(lines)
 
 
 def build_manual_expense_payload(user_id: int, parsed: ParsedManualExpense) -> Dict[str, Any]:
+    # Используем description для хеша (store больше не используется)
     expense_hash = calculate_hash(
-        f"{user_id}|manual|{parsed.store}|{parsed.occurred_at.isoformat()}|{parsed.amount}"
+        f"{user_id}|manual|{parsed.description}|{parsed.occurred_at.isoformat()}|{parsed.amount}"
     )
-    return {
+    payload = {
         "user_id": user_id,
         "source": "manual",
-        "store": parsed.store,
+        "store": parsed.description,  # Используем description как store (для совместимости с базой)
         "amount": parsed.amount,
         "currency": parsed.currency,
         "date": parsed.occurred_at.isoformat(),
-        "note": parsed.note,
+        "note": parsed.note or parsed.description,
         "expense_hash": expense_hash,
         "status": "pending_review",
         "period": parsed.occurred_at.strftime("%Y-%m"),
     }
+    # Добавляем категорию (обязательно должна быть указана)
+    if parsed.category:
+        payload["category"] = parsed.category
+    else:
+        payload["category"] = "Другое"  # Категория по умолчанию, если не указана
+    return payload
 
 
 def _infer_currency(row: Dict[str, Any]) -> Optional[str]:

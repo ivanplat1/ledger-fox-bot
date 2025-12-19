@@ -44,3 +44,4 @@ SELECT
 FROM receipt_recognition_stats
 GROUP BY user_id;
 
+

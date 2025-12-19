@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS expenses (
     store TEXT,
     amount DECIMAL(10, 2) NOT NULL,
     currency TEXT NOT NULL DEFAULT 'RUB',
-    date DATE NOT NULL,
+    date TIMESTAMPTZ NOT NULL,
     receipt_id BIGINT REFERENCES receipts(id) ON DELETE SET NULL,
     bank_transaction_id BIGINT, -- ссылка на bank_transactions если есть
     expense_hash TEXT UNIQUE NOT NULL,
