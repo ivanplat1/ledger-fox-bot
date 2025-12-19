@@ -56,8 +56,10 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
     user_id BIGINT NOT NULL,
     amount DECIMAL(10, 2) NOT NULL,
     currency TEXT NOT NULL DEFAULT 'RUB',
-    transaction_date DATE NOT NULL,
+    booked_at TIMESTAMPTZ NOT NULL,  -- Дата проведения операции (было transaction_date)
     description TEXT,
+    merchant TEXT,  -- Название магазина/контрагента
+    source_id TEXT,  -- ID транзакции из выписки банка
     transaction_hash TEXT UNIQUE NOT NULL,
     bank_name TEXT,
     account_number TEXT,
@@ -67,7 +69,7 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
 
 -- Индексы для таблицы банковских транзакций
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_user_id ON bank_transactions(user_id);
-CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(transaction_date);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_booked_at ON bank_transactions(booked_at);
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_hash ON bank_transactions(transaction_hash);
 
 -- Функция для автоматического обновления updated_at
