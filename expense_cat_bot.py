@@ -1532,7 +1532,7 @@ class SupabaseGateway:
             # Получаем expenses с joined данными из receipts для получения purchased_at с временем
             query = (
                 self._client.table(self.expenses_table)
-                .select("id, store, amount, currency, date, source, category, receipt_id, receipts(purchased_at)")
+                .select("id, store, amount, currency, date, source, category, receipt_id, note, receipts(purchased_at)")
                 .eq("user_id", user_id)
             )
             
@@ -4099,12 +4099,12 @@ class ExpenseCatBot:
                 
                 for expense in expenses:  # Показываем все полученные записи
                     expense_id = expense.get("id")
-                    store = expense.get("store", "Неизвестное место")
                     amount = expense.get("amount", 0)
                     currency = expense.get("currency", "")
                     date = expense.get("date", "")
-                    source = expense.get("source", "")
-                    category = expense.get("category", "")
+                    
+                    # Получаем название продукта из note
+                    note = expense.get("note") or expense.get("description") or "Без названия"
                     
                     # Пытаемся получить время из связанного чека (receipts)
                     purchased_at = None
@@ -4149,45 +4149,11 @@ class ExpenseCatBot:
                     }
                     currency_symbol = currency_symbols.get(currency.upper(), currency.upper()[:3])
                     
-                    # Очищаем название магазина от префиксов (ТОО, ЗАО, Магазин, АЗС, Кафе и т.д.)
-                    store_clean = store
-                    if store_clean:
-                        # Убираем кавычки в начале и конце
-                        store_clean = store_clean.strip('"\'«»')
-                        # Убираем префиксы организационно-правовых форм и типов заведений
-                        prefixes_to_remove = [
-                            r'^ТОО\s+["«]?',
-                            r'^ЗАО\s+["«]?',
-                            r'^ОАО\s+["«]?',
-                            r'^ПАО\s+["«]?',
-                            r'^ООО\s+["«]?',
-                            r'^ИП\s+',
-                            r'^АО\s+["«]?',
-                            r'^ПК\s+["«]?',
-                            r'^ПТ\s+["«]?',
-                            r'^КТ\s+["«]?',
-                            r'^ОДО\s+["«]?',
-                            r'^МАГАЗИН\s+["«]?',
-                            r'^АЗС\s+["«]?',
-                            r'^КАФЕ\s+["«]?',
-                            r'^РЕСТОРАН\s+["«]?',
-                            r'^СУПЕРМАРКЕТ\s+["«]?',
-                            r'^ГИПЕРМАРКЕТ\s+["«]?',
-                            r'^ТОРГОВЫЙ\s+ЦЕНТР\s+["«]?',
-                            r'^ТЦ\s+["«]?',
-                            r'^ТОРГОВЫЙ\s+ДОМ\s+["«]?',
-                            r'^ТД\s+["«]?',
-                        ]
-                        for pattern in prefixes_to_remove:
-                            store_clean = re.sub(pattern, '', store_clean, flags=re.IGNORECASE)
-                        # Убираем кавычки в конце после удаления префикса
-                        store_clean = store_clean.strip('"\'«»').strip()
-                    
                     # Формируем компактный текст кнопки
-                    # Формат: магазин сумма символ_валюты дата_время
-                    store_short = store_clean[:10] if store_clean else (store[:10] if store else "Без названия")
+                    # Формат: название продукта сумма символ_валюты дата_время
+                    note_short = note[:20] if len(note) > 20 else note
                     # Убираем категорию и иконку из кнопки для экономии места
-                    button_text = f"{store_short} {amount:.0f}{currency_symbol} {date_str}"
+                    button_text = f"{note_short} {amount:.0f}{currency_symbol} {date_str}"
                     
                     keyboard_buttons.append([
                         InlineKeyboardButton(
@@ -4831,33 +4797,11 @@ class ExpenseCatBot:
                     await state.clear()
                     return
                 
-                logging.info(f"✅ Все проверки пройдены, переходим к проверке лимита и сохранению")
-                # Проверяем лимит чеков перед сохранением
-                if self.supabase:
-                    logging.info(f"🔍 Проверка лимита чеков перед сохранением (user_id={callback.from_user.id})")
-                    can_save, limits = await self.supabase.check_receipt_limit(callback.from_user.id)
-                    logging.info(f"Результат проверки лимита: can_save={can_save}, limits={limits}")
-                    if not can_save:
-                        receipts_count = limits.get("receipts_count", 0)
-                        limit_receipts = limits.get("limit_receipts", 10)
-                        logging.warning(f"❌ Лимит чеков достигнут: {receipts_count}/{limit_receipts}")
-                        await callback.message.answer(
-                            f"⚠️ Достигнут лимит пробного периода\n\n"
-                            f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
-                            f"Для продолжения распознавания чеков оформите подписку:\n"
-                            f"• 📦 Standard — 50 чеков/месяц за 100 ⭐\n"
-                            f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
-                            f"• 👑 Premium — безлимит за 500 ⭐\n\n"
-                            f"Используйте команду /subscribe для выбора тарифа.\n\n"
-                            f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
-                            f"• 📊 Получение отчетов (/report)\n"
-                            f"• 📥 Выгрузка данных в CSV (/export)\n"
-                            f"• ✏️ Добавление расходов вручную (/expense)"
-                        )
-                        await state.clear()
-                        return
-                    logging.info(f"✅ Лимит не превышен, продолжаем сохранение")
-                else:
+                logging.info(f"✅ Все проверки пройдены, переходим к сохранению")
+                # Лимит уже был проверен при отправке фото, счетчик уже был увеличен после распознавания
+                # Не проверяем лимит повторно при подтверждении, так как это одна операция
+                
+                if not self.supabase:
                     logging.error(f"❌ self.supabase is None, невозможно сохранить чек")
                     await callback.message.answer("⚠️ Ошибка: база данных недоступна")
                     await state.clear()
@@ -5085,7 +5029,7 @@ class ExpenseCatBot:
                 await state.clear()
                 return
             
-            store = expense.get("store", "Неизвестное место")
+            note = expense.get("note") or expense.get("description") or "Без названия"
             amount = expense.get("amount", 0)
             currency = expense.get("currency", "")
             date = expense.get("date", "")
@@ -5121,7 +5065,7 @@ class ExpenseCatBot:
             await callback.message.answer(
                 f"⚠️ Вы уверены, что хотите удалить расход?\n\n"
                 f"{source_icon} Источник: {source_name}\n"
-                f"🏪 Место: {store}\n"
+                f"📝 Название: {note}\n"
                 f"💰 Сумма: {amount:.2f} {currency}\n"
                 f"📅 Дата: {date_str}{category_text}",
                 reply_markup=keyboard
@@ -10589,7 +10533,6 @@ def parse_manual_expense(text: str, default_currency: str = "RUB") -> Optional[P
     detected_currency = (
         currency_from_multiplier
         or _currency_from_value(token_currency)
-        or _currency_from_value(cleaned)
         or default_currency
     )
     date_match = MANUAL_DATE_PATTERN.search(cleaned)
