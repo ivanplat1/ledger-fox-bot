@@ -10124,6 +10124,10 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
     value = raw_value.strip()
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
+    
+    current_year = datetime.utcnow().year
+    current_date = datetime.utcnow()
+    
     for candidate in (value, f"{value}T00:00:00"):
         try:
             dt = datetime.fromisoformat(candidate)
@@ -10143,6 +10147,20 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
                 # Если дата в будущем, уменьшаем год на 1
                 if dt > now:
                     dt = dt.replace(year=dt.year - 1)
+            
+            # Если год слишком старый (более чем на 1 год назад), корректируем
+            # Например, если сейчас 2026, а дата 2023, то это скорее всего ошибка парсинга
+            # Используем текущий год или предыдущий, в зависимости от того, прошла ли эта дата
+            if dt.year < current_year - 1:
+                # Год слишком старый, заменяем на текущий или предыдущий
+                test_date_current = dt.replace(year=current_year)
+                test_date_previous = dt.replace(year=current_year - 1)
+                # Выбираем год так, чтобы дата не была в будущем
+                if test_date_current > current_date:
+                    dt = test_date_previous
+                else:
+                    dt = test_date_current
+            
             return dt
         except ValueError:
             continue
@@ -10151,6 +10169,14 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
         # Если дата в будущем, уменьшаем год на 1
         if dt > datetime.utcnow():
             dt = dt.replace(year=dt.year - 1)
+        # Если год слишком старый, корректируем
+        if dt.year < current_year - 1:
+            test_date_current = dt.replace(year=current_year)
+            test_date_previous = dt.replace(year=current_year - 1)
+            if test_date_current > current_date:
+                dt = test_date_previous
+            else:
+                dt = test_date_current
         return dt
     except ValueError:
         # Пробуем другие форматы даты
@@ -10159,6 +10185,14 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
             dt = datetime.strptime(value, "%d.%m.%Y")
             if dt > datetime.utcnow():
                 dt = dt.replace(year=dt.year - 1)
+            # Если год слишком старый, корректируем
+            if dt.year < current_year - 1:
+                test_date_current = dt.replace(year=current_year)
+                test_date_previous = dt.replace(year=current_year - 1)
+                if test_date_current > current_date:
+                    dt = test_date_previous
+                else:
+                    dt = test_date_current
             return dt
         except ValueError:
             try:
@@ -10168,6 +10202,14 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
                     dt = dt.replace(year=dt.year - 100)
                 if dt > datetime.utcnow():
                     dt = dt.replace(year=dt.year - 1)
+                # Если год слишком старый, корректируем
+                if dt.year < current_year - 1:
+                    test_date_current = dt.replace(year=current_year)
+                    test_date_previous = dt.replace(year=current_year - 1)
+                    if test_date_current > current_date:
+                        dt = test_date_previous
+                    else:
+                        dt = test_date_current
                 return dt
             except ValueError:
                 pass
