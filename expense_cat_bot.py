@@ -660,6 +660,11 @@ class ReceiptParserAI:
         import hashlib
         import json
         
+        # Добавляем текущую дату в промпт, чтобы OpenAI знал, какой год использовать
+        current_date = datetime.utcnow().strftime("%Y-%m-%d")
+        current_year = datetime.utcnow().year
+        date_context = f"\n\nВАЖНО: Сегодняшняя дата: {current_date} (год {current_year}). Если на чеке указана дата без года (например, '6 января'), используй текущий год ({current_year}) или предыдущий ({current_year - 1}), если дата еще не наступила в текущем году."
+        
         # Если есть данные из QR-кода, отправляем их для структурирования
         if qr_data is not None:
             user_text = (
@@ -702,7 +707,7 @@ class ReceiptParserAI:
             logging.info(f"Отправляем данные из QR-кода в OpenAI для структурирования")
             
             # Используем промпт для структурирования данных
-            system_prompt = self.data_prompt
+            system_prompt = self.data_prompt + date_context
             payload = {
                 "model": self.model,
                 "response_format": {"type": "json_object"},
@@ -721,7 +726,7 @@ class ReceiptParserAI:
         else:
             # Если нет URL, отправляем изображение как обычно
             user_text = "Извлеки данные чека и верни JSON."
-            system_prompt = self.prompt
+            system_prompt = self.prompt + date_context
             payload = {
                 "model": self.model,
                 "response_format": {"type": "json_object"},
