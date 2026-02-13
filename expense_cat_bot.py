@@ -1829,7 +1829,7 @@ class SupabaseGateway:
             default_limits = {
                 "user_id": user_id,
                 "receipts_count": 0,
-                "limit_receipts": 10,  # Trial: 10 чеков, Standard: 50 чеков/месяц, Pro: 100 чеков/месяц, Premium: безлимит
+                "limit_receipts": 20,  # Trial: 20 чеков (одноразово), Standard: 50 чеков/месяц, Pro: 100 чеков/месяц, Premium: безлимит
                 "subscription_type": "trial",
                 "expires_at": None,
             }
@@ -1852,7 +1852,7 @@ class SupabaseGateway:
             default_limits = {
                 "user_id": user_id,
                 "receipts_count": 0,
-                "limit_receipts": 10,
+                "limit_receipts": 20,
                 "subscription_type": "trial",
                 "expires_at": None,
             }
@@ -1867,7 +1867,7 @@ class SupabaseGateway:
         """Проверяет, не превышен ли лимит чеков для пользователя"""
         limits = self._get_or_create_user_limits_sync(user_id)
         receipts_count = limits.get("receipts_count", 0)
-        limit_receipts = limits.get("limit_receipts", 10)
+        limit_receipts = limits.get("limit_receipts", 20)
         subscription_type = limits.get("subscription_type", "trial")
         
         # Проверяем подписку Premium (безлимит)
@@ -1884,11 +1884,11 @@ class SupabaseGateway:
                     if expires_dt < datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
                         # Подписка истекла, возвращаемся к пробному периоду
                         subscription_type = "trial"
-                        limit_receipts = 10
+                        limit_receipts = 20
                         # Обновляем лимит в базе
                         self._client.table(self.limits_table).update({
                             "subscription_type": "trial",
-                            "limit_receipts": 10
+                            "limit_receipts": 20
                         }).eq("user_id", user_id).execute()
                         # Инвалидируем кэш
                         self._invalidate_limits_cache(user_id)
@@ -1913,17 +1913,17 @@ class SupabaseGateway:
                 if expires_dt < datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
                     # Подписка истекла, возвращаемся к пробному периоду
                     subscription_type = "trial"
-                    limit_receipts = 10
+                    limit_receipts = 20
                     # Обновляем лимит в базе
                     self._client.table(self.limits_table).update({
                         "subscription_type": "trial",
-                        "limit_receipts": 10
+                        "limit_receipts": 20
                     }).eq("user_id", user_id).execute()
             except:
                 pass
         
         # Устанавливаем лимит в зависимости от типа подписки
-        # Trial: 10 чеков
+        # Trial: 20 чеков (одноразово, не обновляется)
         # Standard: 50 чеков в месяц
         # Pro: 100 чеков в месяц
         # Premium: безлимит (уже обработано выше)
@@ -1948,12 +1948,12 @@ class SupabaseGateway:
                 except:
                     pass
         elif subscription_type == "trial":
-            if limit_receipts != 10:
-                limit_receipts = 10
+            if limit_receipts != 20:
+                limit_receipts = 20
                 # Обновляем лимит в базе
                 try:
                     self._client.table(self.limits_table).update({
-                        "limit_receipts": 10
+                        "limit_receipts": 20
                     }).eq("user_id", user_id).execute()
                 except:
                     pass
@@ -2010,7 +2010,7 @@ class SupabaseGateway:
                 default_limits = {
                     "user_id": user_id,
                     "receipts_count": 1,
-                    "limit_receipts": 10,
+                    "limit_receipts": 20,
                     "subscription_type": "trial",
                     "expires_at": None,
                 }
@@ -2568,9 +2568,20 @@ class ExpenseCatBot:
             logging.exception(f"Error in _process_report_request: {exc}")
             try:
                 message = message_or_callback.message if isinstance(message_or_callback, CallbackQuery) else message_or_callback
-                await message.answer(f"❌ Ошибка при получении отчета: {str(exc)[:200]}")
-            except:
-                logging.error("Failed to send error message to user")
+                # Отправляем техническую ошибку в технический чат
+                if message.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=message.from_user.id,
+                        username=message.from_user.username,
+                        first_name=message.from_user.first_name,
+                        error=exc,
+                        context="Получение отчета",
+                        additional_info=f"start_date={start_date}, end_date={end_date}, period={period}"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await message.answer("❌ Ошибка при получении отчета. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
+            except Exception as send_exc:
+                logging.error(f"Failed to send error message to user: {send_exc}")
             await state.clear()
     
     async def _send_feedback_to_channel(
@@ -2840,6 +2851,81 @@ class ExpenseCatBot:
                 f"   3. Для публичных каналов можно использовать @channel_name"
             )
 
+    async def _send_tech_error_to_channel(
+        self,
+        user_id: int,
+        username: Optional[str],
+        first_name: Optional[str],
+        error: Exception,
+        context: str,
+        additional_info: Optional[str] = None
+    ) -> None:
+        """Отправляет техническую ошибку в технический чат"""
+        if not self.failed_receipts_chat_id:
+            logging.warning("failed_receipts_chat_id not configured, skipping tech error notification")
+            return
+        
+        try:
+            # Формируем сообщение
+            user_info = f"ID: {user_id}"
+            if username:
+                user_info += f" (@{username})"
+            if first_name:
+                user_info += f" - {first_name}"
+            
+            error_type = type(error).__name__
+            error_str = str(error)
+            
+            message_text = (
+                f"🔧 <b>Техническая ошибка</b>\n\n"
+                f"👤 Пользователь: {user_info}\n"
+                f"📋 Контекст: {context}\n"
+                f"❌ Тип ошибки: <code>{error_type}</code>\n"
+                f"💬 Сообщение:\n<code>{error_str[:2000]}</code>\n"
+            )
+            
+            if additional_info:
+                message_text += f"\n📝 Дополнительная информация:\n<code>{additional_info[:1000]}</code>"
+            
+            # Обрезаем до лимита Telegram (4096 символов)
+            MAX_MESSAGE_LENGTH = 4096
+            if len(message_text) > MAX_MESSAGE_LENGTH:
+                message_text = message_text[:MAX_MESSAGE_LENGTH - 50] + "\n\n... (обрезано)"
+            
+            chat_id = self.failed_receipts_chat_id
+            
+            # Определяем chat_id как int или str
+            chat_id_int = None
+            if chat_id.startswith("-") or chat_id.isdigit():
+                try:
+                    chat_id_int = int(chat_id)
+                except ValueError:
+                    pass
+            
+            if chat_id_int is not None:
+                await self.bot.send_message(
+                    chat_id=chat_id_int,
+                    text=message_text,
+                    parse_mode="HTML"
+                )
+                logging.info(f"✅ Tech error sent to channel {chat_id_int}")
+            else:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message_text,
+                    parse_mode="HTML"
+                )
+                logging.info(f"✅ Tech error sent to channel {chat_id}")
+        except Exception as exc:
+            error_msg = str(exc)
+            logging.error(
+                f"❌ Failed to send tech error to channel {self.failed_receipts_chat_id}: {error_msg}\n"
+                f"   Проверьте:\n"
+                f"   1. Бот добавлен в канал как администратор?\n"
+                f"   2. ID канала правильный? (для приватных каналов нужен ID вида -100...)\n"
+                f"   3. Для публичных каналов можно использовать @channel_name"
+            )
+
     def _create_category_keyboard(self) -> InlineKeyboardMarkup:
         """Создает клавиатуру с категориями расходов"""
         categories = [
@@ -3031,7 +3117,7 @@ class ExpenseCatBot:
             limits = await self.supabase.get_or_create_user_limits(message.from_user.id)
             subscription_type = limits.get("subscription_type", "trial")
             receipts_count = limits.get("receipts_count", 0)
-            limit_receipts = limits.get("limit_receipts", 10)
+            limit_receipts = limits.get("limit_receipts", 20)
             expires_at = limits.get("expires_at")
             
             # Определяем название тарифа и эмодзи
@@ -3178,7 +3264,17 @@ class ExpenseCatBot:
                 await message.answer(response, parse_mode="HTML")
             except Exception as exc:
                 logging.exception(f"Error getting receipt stats: {exc}")
-                await message.answer("Ошибка при получении статистики. Попробуйте позже.")
+                # Отправляем техническую ошибку в технический чат
+                if message.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=message.from_user.id,
+                        username=message.from_user.username,
+                        first_name=message.from_user.first_name,
+                        error=exc,
+                        context="Получение статистики чеков"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await message.answer("Ошибка при получении статистики. Попробуйте позже или обратитесь в поддержку через /feedback.")
         
         @self.router.message(Command("subscribe"))
         async def handle_subscribe(message: Message) -> None:
@@ -3208,10 +3304,10 @@ class ExpenseCatBot:
             
             # Формируем биллборд с тарифами
             billboard_text = (
-                "💎 <b>Тарифы ExpenseCatBot</b>\n\n"
+                "💎 <b>Тарифы</b>\n\n"
                 
                 "🆓 <b>Trial</b> (текущий тариф)\n"
-                "• 10 чеков бесплатно\n"
+                "• 20 чеков бесплатно\n"
                 "• Все базовые функции\n"
                 "• Отчеты и экспорт\n\n"
                 
@@ -3396,7 +3492,17 @@ class ExpenseCatBot:
                 await callback.answer()
             except Exception as exc:
                 logging.exception(f"Error sending invoice: {exc}")
-                await callback.answer("Ошибка при создании счета. Попробуйте позже.", show_alert=True)
+                # Отправляем техническую ошибку в технический чат
+                if callback.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=callback.from_user.id,
+                        username=callback.from_user.username,
+                        first_name=callback.from_user.first_name,
+                        error=exc,
+                        context="Отправка счета на оплату"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await callback.answer("Ошибка при создании счета. Попробуйте позже или обратитесь в поддержку через /feedback.", show_alert=True)
         
         @self.router.pre_checkout_query()
         async def handle_pre_checkout_query(pre_checkout_query: PreCheckoutQuery) -> None:
@@ -3566,7 +3672,17 @@ class ExpenseCatBot:
                 logging.error(f"📊 [REPORT] Error type: {type(exc).__name__}")
                 logging.error(f"📊 [REPORT] Error args: {exc.args}")
                 try:
-                    await message.answer(f"❌ Ошибка при обработке команды /report: {str(exc)[:200]}")
+                    # Отправляем техническую ошибку в технический чат
+                    if message.from_user:
+                        await self._send_tech_error_to_channel(
+                            user_id=message.from_user.id,
+                            username=message.from_user.username,
+                            first_name=message.from_user.first_name,
+                            error=exc,
+                            context="Обработка команды /report"
+                        )
+                    # Пользователю отправляем дружелюбное сообщение
+                    await message.answer("❌ Ошибка при обработке команды /report. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
                 except Exception as send_exc:
                     logging.error(f"📊 [REPORT] Failed to send error message to user: {send_exc}")
 
@@ -4167,7 +4283,17 @@ class ExpenseCatBot:
                 logging.info(f"Sent expenses list with {len(keyboard_buttons)} buttons")
             except Exception as exc:
                 logging.exception(f"Error in handle_delete_expense: {exc}")
-                await message.answer(f"❌ Ошибка при получении списка расходов: {str(exc)[:200]}")
+                # Отправляем техническую ошибку в технический чат
+                if message.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=message.from_user.id,
+                        username=message.from_user.username,
+                        first_name=message.from_user.first_name,
+                        error=exc,
+                        context="Получение списка расходов для удаления"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await message.answer("❌ Ошибка при получении списка расходов. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
 
         @self.router.message(Command("settings"))
         async def handle_settings(message: Message, state: FSMContext) -> None:
@@ -4469,9 +4595,20 @@ class ExpenseCatBot:
             except Exception as exc:
                 logging.exception(f"Error in handle_report_currency: {exc}")
                 try:
-                    await callback.message.answer(f"❌ Ошибка при получении отчета: {str(exc)[:200]}")
-                except:
-                    logging.error("Failed to send error message to user")
+                    # Отправляем техническую ошибку в технический чат
+                    if callback.from_user:
+                        await self._send_tech_error_to_channel(
+                            user_id=callback.from_user.id,
+                            username=callback.from_user.username,
+                            first_name=callback.from_user.first_name,
+                            error=exc,
+                            context="Получение отчета по валюте",
+                            additional_info=f"selected_currency={selected_currency if 'selected_currency' in locals() else 'N/A'}"
+                        )
+                    # Пользователю отправляем дружелюбное сообщение
+                    await callback.message.answer("❌ Ошибка при получении отчета. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
+                except Exception as send_exc:
+                    logging.error(f"Failed to send error message to user: {send_exc}")
         
         @self.router.callback_query(F.data.startswith("report_"))
         async def handle_report_period(callback: CallbackQuery, state: FSMContext) -> None:
@@ -4566,9 +4703,20 @@ class ExpenseCatBot:
             except Exception as exc:
                 logging.exception(f"Error in handle_report_period: {exc}")
                 try:
-                    await callback.message.answer(f"❌ Ошибка при получении отчета: {str(exc)[:200]}")
-                except:
-                    logging.error("Failed to send error message to user")
+                    # Отправляем техническую ошибку в технический чат
+                    if callback.from_user:
+                        await self._send_tech_error_to_channel(
+                            user_id=callback.from_user.id,
+                            username=callback.from_user.username,
+                            first_name=callback.from_user.first_name,
+                            error=exc,
+                            context="Получение отчета по периоду",
+                            additional_info=f"period={period if 'period' in locals() else 'N/A'}, start_date={start_date if 'start_date' in locals() else 'N/A'}, end_date={end_date if 'end_date' in locals() else 'N/A'}"
+                        )
+                    # Пользователю отправляем дружелюбное сообщение
+                    await callback.message.answer("❌ Ошибка при получении отчета. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
+                except Exception as send_exc:
+                    logging.error(f"Failed to send error message to user: {send_exc}")
                 await state.clear()
         
         @self.router.callback_query(F.data.startswith("export_"))
@@ -4748,7 +4896,18 @@ class ExpenseCatBot:
                 logging.info(f"Manual expense saved: user={callback.from_user.id}, amount={parsed.amount}, category={category}")
             except Exception as exc:
                 logging.exception(f"Error saving manual expense: {exc}")
-                await callback.message.edit_text(f"❌ Ошибка при сохранении расхода: {str(exc)[:200]}")
+                # Отправляем техническую ошибку в технический чат
+                if callback.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=callback.from_user.id,
+                        username=callback.from_user.username,
+                        first_name=callback.from_user.first_name,
+                        error=exc,
+                        context="Сохранение мануального расхода",
+                        additional_info=f"parsed: {json.dumps(parsed.__dict__ if hasattr(parsed, '__dict__') else str(parsed), ensure_ascii=False, default=str)[:500]}"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await callback.message.edit_text("❌ Ошибка при сохранении расхода. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
             
             await state.clear()
         
@@ -4877,7 +5036,18 @@ class ExpenseCatBot:
                 
                 # Проверяем, что получили реальную запись с id
                 if not stored_receipt or not stored_receipt.get("id"):
-                    await callback.message.answer("⚠️ Ошибка: не удалось сохранить чек в базу данных")
+                    # Отправляем техническую ошибку в технический чат
+                    if callback.from_user:
+                        await self._send_tech_error_to_channel(
+                            user_id=callback.from_user.id,
+                            username=callback.from_user.username,
+                            first_name=callback.from_user.first_name,
+                            error=Exception("stored_receipt is None or missing id"),
+                            context="Сохранение чека - отсутствует id",
+                            additional_info=f"stored_receipt: {json.dumps(stored_receipt, ensure_ascii=False, default=str)[:500] if stored_receipt else 'None'}"
+                        )
+                    # Пользователю отправляем дружелюбное сообщение
+                    await callback.message.answer("⚠️ Ошибка: не удалось сохранить чек в базу данных. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
                     await state.clear()
                     return
                 
@@ -4908,7 +5078,18 @@ class ExpenseCatBot:
                 await state.clear()
             except Exception as exc:
                 logging.exception(f"Ошибка при сохранении чека: {exc}")
-                await callback.message.answer(f"⚠️ Не удалось сохранить в базу: {str(exc)[:100]}")
+                # Отправляем техническую ошибку в технический чат
+                if callback.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=callback.from_user.id,
+                        username=callback.from_user.username,
+                        first_name=callback.from_user.first_name,
+                        error=exc,
+                        context="Сохранение чека в базу данных",
+                        additional_info=f"receipt_payload: {json.dumps(receipt_payload, ensure_ascii=False, default=str)[:500] if 'receipt_payload' in locals() else 'N/A'}"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await callback.message.answer("⚠️ Не удалось сохранить в базу данных. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
                 await state.clear()
 
         @self.router.callback_query(F.data == "receipt_reject")
@@ -4992,7 +5173,17 @@ class ExpenseCatBot:
                 await callback.message.answer(message_text)
             except Exception as exc:
                 logging.exception(f"Ошибка при удалении данных: {exc}")
-                await callback.message.answer(f"⚠️ Ошибка при удалении данных: {str(exc)[:200]}")
+                # Отправляем техническую ошибку в технический чат
+                if callback.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=callback.from_user.id,
+                        username=callback.from_user.username,
+                        first_name=callback.from_user.first_name,
+                        error=exc,
+                        context="Удаление всех данных пользователя"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await callback.message.answer("⚠️ Ошибка при удалении данных. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
             finally:
                 await state.clear()
 
@@ -5107,7 +5298,18 @@ class ExpenseCatBot:
                     await callback.message.answer("❌ Не удалось удалить расход. Возможно, он уже был удален.")
             except Exception as exc:
                 logging.exception(f"Ошибка при удалении расхода: {exc}")
-                await callback.message.answer(f"⚠️ Ошибка при удалении: {str(exc)[:200]}")
+                # Отправляем техническую ошибку в технический чат
+                if callback.from_user:
+                    await self._send_tech_error_to_channel(
+                        user_id=callback.from_user.id,
+                        username=callback.from_user.username,
+                        first_name=callback.from_user.first_name,
+                        error=exc,
+                        context="Удаление расхода",
+                        additional_info=f"expense_id={expense_id if 'expense_id' in locals() else 'N/A'}"
+                    )
+                # Пользователю отправляем дружелюбное сообщение
+                await callback.message.answer("⚠️ Ошибка при удалении расхода. Пожалуйста, попробуйте позже или обратитесь в поддержку через /feedback")
             finally:
                 await state.clear()
 
@@ -5193,9 +5395,9 @@ class ExpenseCatBot:
             logging.info(f"⏱️ [PERF] Проверка лимита: {limit_check_time*1000:.1f}ms")
             if not can_save:
                 receipts_count = limits.get("receipts_count", 0)
-                limit_receipts = limits.get("limit_receipts", 10)
+                limit_receipts = limits.get("limit_receipts", 20)
                 await message.answer(
-                    f"⚠️ Достигнут лимит пробного периода\n\n"
+                    f"⚠️ Достигнут лимит запросов\n\n"
                     f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
                     f"Для продолжения распознавания чеков оформите подписку:\n"
                     f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
@@ -5370,12 +5572,18 @@ class ExpenseCatBot:
                     items_sum = sum(item.price for item in result.parsed_receipt.items)
                     total = result.parsed_receipt.total or 0.0
                     items_count = len(result.parsed_receipt.items)
+                    # Форматируем дату для отображения
+                    date_str = ""
+                    if result.parsed_receipt.purchased_at:
+                        date_str = result.parsed_receipt.purchased_at.strftime("%d.%m.%Y")
                     validation_text = (
                         f"✅ Валидация пройдена:\n"
                         f"Товаров в чеке: {items_count}\n"
                         f"Сумма всех позиций: {items_sum:.2f} {result.parsed_receipt.currency}\n"
                         f"Итого по чеку: {total:.2f} {result.parsed_receipt.currency}"
                     )
+                    if date_str:
+                        validation_text += f"\n📅 Дата: {date_str}"
                     await message.answer(validation_text)
                     
                     # Добавляем дополнительную информацию текстом, если есть
@@ -9053,9 +9261,46 @@ def _find_first_date(text: str) -> Optional[str]:
     match = re.search(r"(\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?)", text)
     if match:
         token = match.group(1)
-        if len(token.split(".")) == 2:
+        parts = token.replace("-", ".").replace("/", ".").split(".")
+        if len(parts) == 2:
+            # Нет года, добавляем текущий год
+            day, month = parts[0], parts[1]
             current_year = datetime.utcnow().year
-            return f"{token}.{current_year}"
+            # Пробуем распарсить дату с текущим годом
+            try:
+                test_date = datetime.strptime(f"{day}.{month}.{current_year}", "%d.%m.%Y")
+                # Если дата в будущем, используем предыдущий год
+                if test_date > datetime.utcnow():
+                    current_year -= 1
+            except ValueError:
+                pass
+            return f"{day}.{month}.{current_year}"
+        elif len(parts) == 3:
+            # Есть год, проверяем, не в будущем ли дата
+            day, month, year_str = parts[0], parts[1], parts[2]
+            try:
+                # Если год двухзначный (например, 23), интерпретируем как 20XX
+                if len(year_str) == 2:
+                    year_short = int(year_str)
+                    # Интерпретируем как текущий век (20XX)
+                    year = 2000 + year_short
+                    # Проверяем, не в будущем ли дата
+                    test_date = datetime.strptime(f"{day}.{month}.{year}", "%d.%m.%Y")
+                    if test_date > datetime.utcnow():
+                        # Если дата в будущем, уменьшаем год на 1
+                        year -= 1
+                else:
+                    # Год четырехзначный
+                    year = int(year_str)
+                    # Проверяем, не в будущем ли дата
+                    test_date = datetime.strptime(f"{day}.{month}.{year}", "%d.%m.%Y")
+                    if test_date > datetime.utcnow():
+                        # Если дата в будущем, уменьшаем год на 1
+                        year -= 1
+                return f"{day}.{month}.{year}"
+            except (ValueError, TypeError):
+                # Если не удалось распарсить, возвращаем как есть
+                return token
         return token
     return None
 
@@ -9881,13 +10126,39 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
         value = value[:-1] + "+00:00"
     for candidate in (value, f"{value}T00:00:00"):
         try:
-            return datetime.fromisoformat(candidate)
+            dt = datetime.fromisoformat(candidate)
+            # Если дата в будущем, уменьшаем год на 1
+            if dt > datetime.utcnow():
+                dt = dt.replace(year=dt.year - 1)
+            return dt
         except ValueError:
             continue
     try:
-        return datetime.strptime(value, "%Y-%m-%d")
+        dt = datetime.strptime(value, "%Y-%m-%d")
+        # Если дата в будущем, уменьшаем год на 1
+        if dt > datetime.utcnow():
+            dt = dt.replace(year=dt.year - 1)
+        return dt
     except ValueError:
-        return datetime.utcnow()
+        # Пробуем другие форматы даты
+        try:
+            # Формат DD.MM.YYYY или DD.MM.YY
+            dt = datetime.strptime(value, "%d.%m.%Y")
+            if dt > datetime.utcnow():
+                dt = dt.replace(year=dt.year - 1)
+            return dt
+        except ValueError:
+            try:
+                dt = datetime.strptime(value, "%d.%m.%y")
+                # Если год двухзначный, интерпретируем правильно
+                if dt.year > datetime.utcnow().year:
+                    dt = dt.replace(year=dt.year - 100)
+                if dt > datetime.utcnow():
+                    dt = dt.replace(year=dt.year - 1)
+                return dt
+            except ValueError:
+                pass
+    return datetime.utcnow()
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
