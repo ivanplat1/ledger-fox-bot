@@ -3,6 +3,8 @@ nixPkgs = ["python311", "tesseract", "tesseract-ocr-rus", "tesseract-ocr-kaz", "
 
 [phases.install]
 cmds = [
+    "apt-get update || true",
+    "apt-get install -y --no-install-recommends libgl1 libglib2.0-0 || true",
     "pip install --upgrade pip",
     "pip install -r requirements.txt"
 ]
