@@ -10127,9 +10127,22 @@ def parse_datetime_flexible(raw_value: Optional[str]) -> datetime:
     for candidate in (value, f"{value}T00:00:00"):
         try:
             dt = datetime.fromisoformat(candidate)
-            # Если дата в будущем, уменьшаем год на 1
-            if dt > datetime.utcnow():
-                dt = dt.replace(year=dt.year - 1)
+            # Проверяем, aware или naive datetime
+            if dt.tzinfo is not None:
+                # Aware datetime - сравниваем с aware
+                from datetime import timezone
+                now = datetime.now(timezone.utc)
+                # Если дата в будущем, уменьшаем год на 1
+                if dt > now:
+                    dt = dt.replace(year=dt.year - 1)
+                # Возвращаем naive datetime для совместимости
+                dt = dt.replace(tzinfo=None)
+            else:
+                # Naive datetime - сравниваем с naive
+                now = datetime.utcnow()
+                # Если дата в будущем, уменьшаем год на 1
+                if dt > now:
+                    dt = dt.replace(year=dt.year - 1)
             return dt
         except ValueError:
             continue
