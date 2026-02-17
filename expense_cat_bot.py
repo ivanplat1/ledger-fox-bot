@@ -9702,26 +9702,49 @@ def read_qr_codes(file_bytes: bytes) -> List[Dict[str, Any]]:
                 # Используем QRCodeDetector из OpenCV
                 qr_detector = cv2.QRCodeDetector()
                 
+                # Пробуем также обрезать нижнюю часть изображения (где обычно находится QR-код на чеках)
+                # Берем нижние 40% изображения
+                h, w = gray.shape
+                bottom_crop = gray[int(h * 0.6):, :]  # Нижние 40%
+                bottom_half = gray[int(h * 0.5):, :]  # Нижняя половина
+                
                 # Улучшаем контраст перед обработкой
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
                 gray_clahe = clahe.apply(gray)
+                bottom_crop_clahe = clahe.apply(bottom_crop)
+                bottom_half_clahe = clahe.apply(bottom_half)
                 
                 # Увеличиваем изображение для лучшего распознавания (QR-коды должны быть достаточно большими)
                 scale_factor = 3
+                scale_factor_5 = 5  # Еще большее увеличение для маленьких QR-кодов
                 gray_large = cv2.resize(gray, (gray.shape[1] * scale_factor, gray.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
+                gray_very_large = cv2.resize(gray, (gray.shape[1] * scale_factor_5, gray.shape[0] * scale_factor_5), interpolation=cv2.INTER_CUBIC)
                 gray_clahe_large = cv2.resize(gray_clahe, (gray_clahe.shape[1] * scale_factor, gray_clahe.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
+                bottom_crop_large = cv2.resize(bottom_crop, (bottom_crop.shape[1] * scale_factor, bottom_crop.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
+                bottom_half_large = cv2.resize(bottom_half, (bottom_half.shape[1] * scale_factor, bottom_half.shape[0] * scale_factor), interpolation=cv2.INTER_CUBIC)
                 
                 # Пробуем несколько вариантов обработки
                 gray_variants = [
                     ("original", gray),
                     ("original_large", gray_large),
+                    ("original_very_large", gray_very_large),
+                    ("bottom_crop", bottom_crop),
+                    ("bottom_crop_large", bottom_crop_large),
+                    ("bottom_half", bottom_half),
+                    ("bottom_half_large", bottom_half_large),
                     ("clahe", gray_clahe),
                     ("clahe_large", gray_clahe_large),
+                    ("bottom_crop_clahe", bottom_crop_clahe),
+                    ("bottom_half_clahe", bottom_half_clahe),
                     ("adaptive", cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
                     ("adaptive_large", cv2.adaptiveThreshold(gray_large, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
+                    ("adaptive_bottom_crop", cv2.adaptiveThreshold(bottom_crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
+                    ("adaptive_bottom_crop_large", cv2.adaptiveThreshold(bottom_crop_large, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)),
                     ("adaptive_inv", cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)),
                     ("otsu", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
                     ("otsu_large", cv2.threshold(gray_large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                    ("otsu_bottom_crop", cv2.threshold(bottom_crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+                    ("otsu_bottom_crop_large", cv2.threshold(bottom_crop_large, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
                     ("otsu_inv", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]),
                 ]
                 
