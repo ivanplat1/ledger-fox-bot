@@ -223,6 +223,10 @@ class ProcessingResult:
     parsed_receipt: Optional[ParsedReceipt] = None
     receipt_payload: Optional[Dict[str, Any]] = None
     qr_url_found_but_failed: Optional[str] = None  # URL QR-кода, если он был найден, но данные не получены
+    qr_codes: Optional[List[Dict[str, Any]]] = None  # Найденные QR-коды
+    qr_parsing_info: Optional[Dict[str, Dict[str, Any]]] = None  # Информация о парсинге QR-кодов
+    qr_time: Optional[float] = None  # Время чтения QR-кодов
+    openai_time: Optional[float] = None  # Время OpenAI запроса
     file_bytes: Optional[bytes] = None  # Байты файла для возможного сохранения при отклонении
     mime_type: Optional[str] = None  # MIME тип файла
     recognition_method: Optional[str] = None  # Способ распознавания: 'qr', 'openai_photo', 'openai_qr_data'
@@ -5543,10 +5547,52 @@ class ExpenseCatBot:
                 if result.qr_url_found_but_failed:
                     error_message += (
                         f"⚠️ Не удалось получить данные по QR-коду.\n"
-                        f"Пожалуйста, отправьте полное фото чека со всеми позициями."
+                        f"Пожалуйста, отправьте полное фото чека со всеми позициями.\n"
                     )
                 else:
-                    error_message += "Пожалуйста, отправьте фото чека заново."
+                    error_message += "Пожалуйста, отправьте фото чека заново.\n"
+                
+                # Добавляем детальную информацию о QR-кодах для отладки
+                if result.qr_codes:
+                    error_message += "\n📱 Найденные QR-коды:\n"
+                    # Определяем финальный метод распознавания
+                    final_method = result.recognition_method or "unknown"
+                    if final_method == "openai_qr_data":
+                        final_method_desc = "✅ Данные из QR-кода (структурирование через OpenAI)"
+                    else:
+                        final_method_desc = "📷 Распознавание по фото (OpenAI Vision)"
+                    
+                    error_message += f"Метод распознавания: {final_method_desc}\n"
+                    if result.qr_time:
+                        error_message += f"Время чтения QR-кодов: {result.qr_time*1000:.1f}мс\n"
+                    if result.openai_time:
+                        error_message += f"Время OpenAI запроса: {result.openai_time*1000:.1f}мс ({result.openai_time:.2f}с)\n"
+                    error_message += "\n"
+                    
+                    for i, qr in enumerate(result.qr_codes, 1):
+                        error_message += f"{i}. Тип: {qr['type']}\n"
+                        qr_data = qr['data']
+                        qr_data_preview = qr_data[:100] + "..." if len(qr_data) > 100 else qr_data
+                        error_message += f"   Данные: {qr_data_preview}\n"
+                        
+                        # Добавляем информацию о парсинге, если есть
+                        if result.qr_parsing_info and qr_data in result.qr_parsing_info:
+                            info = result.qr_parsing_info[qr_data]
+                            if info.get("status") == "success":
+                                error_message += f"   ✅ Успешно получены данные за {info.get('fetch_time_ms', 0):.1f}мс"
+                                if info.get("items_count") is not None:
+                                    error_message += f" ({info['items_count']} позиций)"
+                                error_message += "\n"
+                            elif info.get("status") == "failed":
+                                error_message += f"   ❌ Не удалось получить данные за {info.get('fetch_time_ms', 0):.1f}мс"
+                                if info.get("reason"):
+                                    error_message += f" ({info['reason']})"
+                                error_message += "\n"
+                            elif info.get("status") == "ignored":
+                                error_message += f"   ⏭️ Игнорирован: {info.get('reason', '')}\n"
+                            elif info.get("status") == "not_url":
+                                error_message += f"   ℹ️ {info.get('reason', '')}\n"
+                        error_message += "\n"
                 
                 await message.answer(error_message)
                 await state.clear()  # Очищаем состояние FSM
@@ -5752,13 +5798,50 @@ class ExpenseCatBot:
                         qr_data_from_url = None  # Сброс, чтобы использовать изображение
                         # Сохраняем информацию о том, что QR был найден, но данные не получены
                         qr_url_found_but_failed = qr_data
+                        
+                        # Пытаемся определить причину ошибки, проверяя URL напрямую
+                        failure_reason = "не удалось получить данные"
+                        try:
+                            check_response = requests.get(
+                                qr_data,
+                                timeout=5,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                                verify=False,
+                                allow_redirects=True
+                            )
+                            if check_response.status_code != 200:
+                                failure_reason = f"HTTP статус {check_response.status_code}"
+                            else:
+                                # Проверяем на наличие капчи в HTML
+                                html_content = check_response.text.lower()
+                                captcha_indicators = [
+                                    "captcha", "recaptcha", "hcaptcha", "cloudflare", 
+                                    "проверка на робота", "подтвердите что вы не робот",
+                                    "verify you are human", "challenge"
+                                ]
+                                if any(indicator in html_content for indicator in captcha_indicators):
+                                    failure_reason = "обнаружена капча (проверка на робота)"
+                                elif "text/html" in check_response.headers.get("Content-Type", "").lower():
+                                    # Проверяем, есть ли данные в HTML
+                                    if len(html_content) < 1000:  # Очень короткий ответ
+                                        failure_reason = "получен пустой или короткий HTML ответ"
+                                    else:
+                                        failure_reason = "не удалось извлечь данные из HTML (возможно требуется JavaScript)"
+                        except Exception as check_exc:
+                            if "timeout" in str(check_exc).lower():
+                                failure_reason = "таймаут при запросе"
+                            elif "connection" in str(check_exc).lower():
+                                failure_reason = "ошибка подключения"
+                            else:
+                                failure_reason = f"ошибка: {type(check_exc).__name__}"
+                        
                         qr_parsing_info[qr_data] = {
                             "type": qr_type,
                             "data_preview": qr_data[:80] + "..." if len(qr_data) > 80 else qr_data,
                             "status": "failed",
                             "method": "qr_url",
                             "fetch_time_ms": round(qr_fetch_time * 1000, 1),
-                            "reason": "не удалось получить данные (возможно капча или недоступен сервер)"
+                            "reason": failure_reason
                         }
                     # Если найден QR-код с URL, игнорируем все остальные коды
                     break
@@ -6048,6 +6131,10 @@ class ExpenseCatBot:
                     parsed_receipt=parsed_receipt,
                     receipt_payload=receipt_payload,
                     qr_url_found_but_failed=qr_url_found_but_failed,
+                    qr_codes=qr_codes if qr_codes else None,
+                    qr_parsing_info=qr_parsing_info if qr_parsing_info else None,
+                    qr_time=qr_time,
+                    openai_time=openai_time,
                     file_bytes=file_bytes_for_storage,
                     mime_type=mime_type_for_storage,
                     recognition_method=recognition_method,
@@ -6219,7 +6306,25 @@ class ExpenseCatBot:
                 except Exception as stat_exc:
                     logging.warning(f"Failed to save recognition stat: {stat_exc}")
             
-            return ProcessingResult(success=False, error=user_error, file_bytes=file_bytes_for_storage, mime_type=mime_type_for_storage, recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo")
+            # Получаем значения переменных, если они были определены
+            qr_codes_val = qr_codes if 'qr_codes' in locals() and qr_codes else None
+            qr_parsing_info_val = qr_parsing_info if 'qr_parsing_info' in locals() and qr_parsing_info else None
+            qr_time_val = qr_time if 'qr_time' in locals() else None
+            openai_time_val = openai_time if 'openai_time' in locals() else None
+            qr_url_found_but_failed_val = qr_url_found_but_failed if 'qr_url_found_but_failed' in locals() else None
+            
+            return ProcessingResult(
+                success=False, 
+                error=user_error, 
+                file_bytes=file_bytes_for_storage, 
+                mime_type=mime_type_for_storage, 
+                recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo",
+                qr_codes=qr_codes_val,
+                qr_parsing_info=qr_parsing_info_val,
+                qr_time=qr_time_val,
+                openai_time=openai_time_val,
+                qr_url_found_but_failed=qr_url_found_but_failed_val
+            )
         except Exception as exc:
             logging.exception("Image preprocessing or parsing failed")
             error_msg = str(exc)
@@ -6239,7 +6344,25 @@ class ExpenseCatBot:
                 except Exception as stat_exc:
                     logging.warning(f"Failed to save recognition stat: {stat_exc}")
             
-            return ProcessingResult(success=False, error=user_error, file_bytes=file_bytes_for_storage, mime_type=mime_type_for_storage, recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo")
+            # Получаем значения переменных, если они были определены
+            qr_codes_val = qr_codes if 'qr_codes' in locals() and qr_codes else None
+            qr_parsing_info_val = qr_parsing_info if 'qr_parsing_info' in locals() and qr_parsing_info else None
+            qr_time_val = qr_time if 'qr_time' in locals() else None
+            openai_time_val = openai_time if 'openai_time' in locals() else None
+            qr_url_found_but_failed_val = qr_url_found_but_failed if 'qr_url_found_but_failed' in locals() else None
+            
+            return ProcessingResult(
+                success=False, 
+                error=user_error, 
+                file_bytes=file_bytes_for_storage, 
+                mime_type=mime_type_for_storage, 
+                recognition_method=recognition_method if 'recognition_method' in locals() else "openai_photo",
+                qr_codes=qr_codes_val,
+                qr_parsing_info=qr_parsing_info_val,
+                qr_time=qr_time_val,
+                openai_time=openai_time_val,
+                qr_url_found_but_failed=qr_url_found_but_failed_val
+            )
 
     async def _handle_statement_from_message(self, message: Message) -> ProcessingResult:
         file = await self._resolve_file(message)
