@@ -3186,9 +3186,9 @@ class ExpenseCatBot:
             # Определяем название тарифа и эмодзи
             subscription_info = {
                 "trial": ("Trial", "🆓", "бесплатно"),
-                "standard": ("Standard", "📦", "100 ⭐/мес"),
-                "pro": ("Pro", "⭐", "200 ⭐/мес"),
-                "premium": ("Premium", "👑", "500 ⭐/мес"),
+                "standard": ("Standard", "📦", "1 ⭐/мес (ТЕСТ)"),
+                "pro": ("Pro", "⭐", "1 ⭐/мес (ТЕСТ)"),
+                "premium": ("Premium", "👑", "1 ⭐/мес (ТЕСТ)"),
             }
             sub_name, sub_emoji, sub_price = subscription_info.get(subscription_type, ("Unknown", "❓", "?"))
             
@@ -3374,15 +3374,15 @@ class ExpenseCatBot:
                 "• Все базовые функции\n"
                 "• Отчеты и экспорт\n\n"
                 
-                "📦 <b>Standard</b> — 100 ⭐/месяц\n"
+                "📦 <b>Standard</b> — 1 ⭐/месяц (ТЕСТ)\n"
                 "• 50 чеков в месяц\n"
                 "• Все функции бота\n\n"
                 
-                "⭐ <b>Pro</b> — 200 ⭐/месяц\n"
+                "⭐ <b>Pro</b> — 1 ⭐/месяц (ТЕСТ)\n"
                 "• 100 чеков в месяц\n"
                 "• Все функции бота\n\n"
                 
-                "👑 <b>Premium</b> — 500 ⭐/месяц\n"
+                "👑 <b>Premium</b> — 1 ⭐/месяц (ТЕСТ)\n"
                 "• Безлимит чеков\n"
                 "• Все функции бота\n\n"
             )
@@ -3435,13 +3435,13 @@ class ExpenseCatBot:
             # Создаем кнопки для выбора тарифа (каждая кнопка на отдельной строке)
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
-                    InlineKeyboardButton(text="📦 Standard — 100 ⭐/мес", callback_data="subscribe_standard"),
+                    InlineKeyboardButton(text="📦 Standard — 1 ⭐/мес (ТЕСТ)", callback_data="subscribe_standard"),
                 ],
                 [
-                    InlineKeyboardButton(text="⭐ Pro — 200 ⭐/мес", callback_data="subscribe_pro"),
+                    InlineKeyboardButton(text="⭐ Pro — 1 ⭐/мес (ТЕСТ)", callback_data="subscribe_pro"),
                 ],
                 [
-                    InlineKeyboardButton(text="👑 Premium — 500 ⭐/мес", callback_data="subscribe_premium"),
+                    InlineKeyboardButton(text="👑 Premium — 1 ⭐/мес (ТЕСТ)", callback_data="subscribe_premium"),
                 ]
             ])
             
@@ -3465,7 +3465,7 @@ class ExpenseCatBot:
                 current_subscription = limits.get("subscription_type", "trial")
                 expires_at = limits.get("expires_at")
                 
-                # Если уже есть активная подписка того же или более высокого уровня
+                # Проверяем активную подписку и блокируем повторную оплату
                 subscription_levels = {"trial": 0, "standard": 1, "pro": 2, "premium": 3}
                 current_level = subscription_levels.get(current_subscription, 0)
                 selected_level = subscription_levels.get(subscription_type, 0)
@@ -3477,6 +3477,7 @@ class ExpenseCatBot:
                         else:
                             expires_dt = expires_at
                         if expires_dt > datetime.utcnow().replace(tzinfo=expires_dt.tzinfo):
+                            # Если пытаются оплатить тот же тариф или более низкий
                             if current_level >= selected_level:
                                 expires_str = expires_dt.strftime("%d.%m.%Y")
                                 subscription_names = {
@@ -3484,43 +3485,60 @@ class ExpenseCatBot:
                                     "pro": "Pro",
                                     "premium": "Premium"
                                 }
-                                await callback.answer(
-                                    f"У вас уже активна {subscription_names.get(current_subscription, '')} подписка до {expires_str}",
-                                    show_alert=True
-                                )
+                                current_name = subscription_names.get(current_subscription, current_subscription)
+                                
+                                if current_level == selected_level:
+                                    # Пытаются оплатить тот же тариф
+                                    await callback.answer(
+                                        f"❌ У вас уже активна {current_name} подписка до {expires_str}.\n"
+                                        f"Нельзя оплатить тот же тариф повторно.",
+                                        show_alert=True
+                                    )
+                                else:
+                                    # Пытаются оплатить более низкий тариф
+                                    await callback.answer(
+                                        f"❌ У вас уже активна {current_name} подписка до {expires_str}.\n"
+                                        f"Нельзя перейти на более низкий тариф.",
+                                        show_alert=True
+                                    )
                                 return
-                    except:
+                    except Exception as exc:
+                        logging.warning(f"Ошибка при проверке подписки: {exc}")
                         pass
             
             # Определяем параметры подписки
+            # ВРЕМЕННО: минимальные цены для тестирования биллинга
             if subscription_type == "standard":
-                price_amount = 100
-                title = "Standard подписка ExpenseCatBot"
+                price_amount = 1  # ВРЕМЕННО: было 100
+                title = "Standard подписка ExpenseCatBot (ТЕСТ)"
                 description = (
                     "Получите Standard подписку и увеличьте лимит до 50 чеков в месяц!\n\n"
                     "✨ Что входит:\n"
                     "• 50 чеков в месяц (вместо 10)\n"
-                    "• Все функции бота без ограничений"
+                    "• Все функции бота без ограничений\n\n"
+                    "⚠️ ТЕСТОВАЯ ЦЕНА: 1 ⭐"
                 )
                 limit_receipts = 50
             elif subscription_type == "pro":
-                price_amount = 200
-                title = "Pro подписка ExpenseCatBot"
+                price_amount = 1  # ВРЕМЕННО: было 200
+                title = "Pro подписка ExpenseCatBot (ТЕСТ)"
                 description = (
                     "Получите Pro подписку и увеличьте лимит до 100 чеков в месяц!\n\n"
                     "✨ Что входит:\n"
                     "• 100 чеков в месяц (вместо 10)\n"
-                    "• Все функции бота без ограничений"
+                    "• Все функции бота без ограничений\n\n"
+                    "⚠️ ТЕСТОВАЯ ЦЕНА: 1 ⭐"
                 )
                 limit_receipts = 100
             elif subscription_type == "premium":
-                price_amount = 500
-                title = "Premium подписка ExpenseCatBot"
+                price_amount = 1  # ВРЕМЕННО: было 500
+                title = "Premium подписка ExpenseCatBot (ТЕСТ)"
                 description = (
                     "Получите Premium подписку с безлимитным количеством чеков!\n\n"
                     "✨ Что входит:\n"
                     "• Безлимит чеков\n"
-                    "• Все функции бота без ограничений"
+                    "• Все функции бота без ограничений\n\n"
+                    "⚠️ ТЕСТОВАЯ ЦЕНА: 1 ⭐"
                 )
                 limit_receipts = None  # Безлимит
             
@@ -5463,8 +5481,9 @@ class ExpenseCatBot:
                     f"⚠️ Достигнут лимит запросов\n\n"
                     f"📊 Использовано чеков: {receipts_count}/{limit_receipts}\n\n"
                     f"Для продолжения распознавания чеков оформите подписку:\n"
-                    f"• ⭐ Pro — 100 чеков/месяц за 200 ⭐\n"
-                    f"• 👑 Premium — безлимит за 500 ⭐\n\n"
+                    f"• 📦 Standard — 50 чеков/месяц за 1 ⭐ (ТЕСТ)\n"
+                    f"• ⭐ Pro — 100 чеков/месяц за 1 ⭐ (ТЕСТ)\n"
+                    f"• 👑 Premium — безлимит за 1 ⭐ (ТЕСТ)\n\n"
                     f"Используйте команду /subscribe для выбора тарифа.\n\n"
                     f"💡 Вы все еще можете использовать функции, которые не требуют распознавания:\n"
                     f"• 📊 Получение отчетов (/report)\n"
